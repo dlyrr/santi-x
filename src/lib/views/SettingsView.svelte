@@ -13,7 +13,12 @@
     type Settings,
     type Theme
   } from '$lib/api';
-  import { THEMES } from '$lib/types';
+  import {
+    SCROLL_DELAY_MS,
+    SCROLL_MAX_FRAMES,
+    SCROLL_STEP,
+    THEMES
+  } from '$lib/types';
   import { settings } from '$lib/stores/settings.svelte';
   import { toast } from '$lib/components/Toast.svelte';
 
@@ -94,6 +99,11 @@
   let dirDraft = $state('');
   let patternDraft = $state('');
   let strokeDraft = $state(4);
+  // Annotated: the bounds are `as const`, so an inferred draft would be the
+  // literal type of its default and refuse every other value on the slider.
+  let scrollDelayDraft = $state<number>(SCROLL_DELAY_MS.def);
+  let scrollStepDraft = $state<number>(SCROLL_STEP.def);
+  let scrollFramesDraft = $state<number>(SCROLL_MAX_FRAMES.def);
   let recording = $state<HotkeyKey | null>(null);
   let hotkeyError = $state('');
   let hotkeyStatus = $state<HotkeyStatus[]>([]);
@@ -115,6 +125,21 @@
 
   $effect(() => {
     if (s) strokeDraft = s.editorDefaultStroke;
+  });
+
+  // The `??` is for a `settings.json` written before M5: Rust fills the three in
+  // on load, but a slider that binds `undefined` renders at its midpoint and
+  // then writes that midpoint back on the first drag.
+  $effect(() => {
+    if (s) scrollDelayDraft = s.scrollDelayMs ?? SCROLL_DELAY_MS.def;
+  });
+
+  $effect(() => {
+    if (s) scrollStepDraft = s.scrollStep ?? SCROLL_STEP.def;
+  });
+
+  $effect(() => {
+    if (s) scrollFramesDraft = s.scrollMaxFrames ?? SCROLL_MAX_FRAMES.def;
   });
 
   $effect(() => {
@@ -273,6 +298,21 @@
   function commitStroke() {
     if (!s || strokeDraft === s.editorDefaultStroke) return;
     void patch({ editorDefaultStroke: strokeDraft });
+  }
+
+  function commitScrollDelay() {
+    if (!s || scrollDelayDraft === s.scrollDelayMs) return;
+    void patch({ scrollDelayMs: scrollDelayDraft });
+  }
+
+  function commitScrollStep() {
+    if (!s || scrollStepDraft === s.scrollStep) return;
+    void patch({ scrollStep: scrollStepDraft });
+  }
+
+  function commitScrollFrames() {
+    if (!s || scrollFramesDraft === s.scrollMaxFrames) return;
+    void patch({ scrollMaxFrames: scrollFramesDraft });
   }
 
   function resolvePattern(pattern: string, kind: string, at: number): string {
@@ -597,6 +637,89 @@
         labelledBy="lbl-hide-window"
         onchange={(v) => patch({ hideWindowOnCapture: v })}
       />
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="sec-scrolling">
+    <h2 class="section-title" id="sec-scrolling">Scrolling capture</h2>
+    <p class="section-help">
+      How the long-page stitcher drives the window it is capturing. It finds the real overlap
+      between consecutive frames rather than trusting the scroll distance, so these tune the
+      scrolling, not the joining.
+    </p>
+
+    <div class="row">
+      <span class="row-text">
+        <label class="row-label" for="scroll-delay">Settle delay</label>
+        <span class="row-help">
+          How long to wait after each wheel step before taking the next shot. Too short and the
+          frame catches a smooth scroll still in flight, which the overlap search reads as a bad
+          match and stops the run early.
+        </span>
+      </span>
+      <div class="field">
+        <input
+          id="scroll-delay"
+          class="range"
+          type="range"
+          min={SCROLL_DELAY_MS.min}
+          max={SCROLL_DELAY_MS.max}
+          step={SCROLL_DELAY_MS.step}
+          bind:value={scrollDelayDraft}
+          onchange={commitScrollDelay}
+        />
+        <span class="range-value mono num">{scrollDelayDraft} ms</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <span class="row-text">
+        <label class="row-label" for="scroll-step">Scroll step</label>
+        <span class="row-help">
+          Wheel notches sent per step. Bigger steps finish a long page in fewer frames, but leave
+          less overlap for the stitcher to lock onto — and no overlap ends the run.
+        </span>
+      </span>
+      <div class="field">
+        <input
+          id="scroll-step"
+          class="range"
+          type="range"
+          min={SCROLL_STEP.min}
+          max={SCROLL_STEP.max}
+          step={SCROLL_STEP.step}
+          bind:value={scrollStepDraft}
+          onchange={commitScrollStep}
+        />
+        <span class="range-value mono num">
+          {scrollStepDraft}
+          {scrollStepDraft === 1 ? 'notch' : 'notches'}
+        </span>
+      </div>
+    </div>
+
+    <div class="row">
+      <span class="row-text">
+        <label class="row-label" for="scroll-frames">Maximum frames</label>
+        <span class="row-help">
+          A hard stop, so a page that never stops scrolling cannot run forever. Reaching it keeps
+          everything stitched so far and says the capture is the top of the page rather than all
+          of it.
+        </span>
+      </span>
+      <div class="field">
+        <input
+          id="scroll-frames"
+          class="range"
+          type="range"
+          min={SCROLL_MAX_FRAMES.min}
+          max={SCROLL_MAX_FRAMES.max}
+          step={SCROLL_MAX_FRAMES.step}
+          bind:value={scrollFramesDraft}
+          onchange={commitScrollFrames}
+        />
+        <span class="range-value mono num">{scrollFramesDraft} frames</span>
+      </div>
     </div>
   </section>
 
@@ -1121,6 +1244,14 @@
 
   .stroke-value {
     min-width: 44px;
+    text-align: right;
+    color: var(--text-dim);
+  }
+
+  /* Same readout as .stroke-value, wider because the units are words: the
+     number must not shuffle sideways as the slider moves. */
+  .range-value {
+    min-width: 84px;
     text-align: right;
     color: var(--text-dim);
   }

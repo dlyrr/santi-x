@@ -124,14 +124,36 @@ export interface Settings {
   /** Register santi.sharex to start with Windows. Kept in sync with the real
    *  registration on every load and save. */
   launchAtLogin: boolean;
+  /**
+   * Settle time in milliseconds between one wheel step and the screenshot that
+   * follows it (M5 §4). Too short and the frame catches a smooth-scroll
+   * mid-flight, which the overlap search then reads as a bad match.
+   */
+  scrollDelayMs: number;
+  /** Wheel notches sent per step. */
+  scrollStep: number;
+  /** Hard stop on the number of frames one run may capture. */
+  scrollMaxFrames: number;
   hotkeys: Hotkeys;
 }
 
 /**
- * Which capture path produced a record. Mirrors `CaptureRecord.kind`.
- * `edit` comes from `saveEdit(..., replace: false)`, not from a capture.
+ * Bounds and defaults for the three scrolling-capture settings, kept beside the
+ * fields they describe so the sliders and Rust's clamps cannot drift apart.
+ * `def` is what a fresh install writes (M5 §4).
  */
-export type CaptureKind = 'region' | 'fullscreen' | 'window' | 'monitor' | 'edit';
+export const SCROLL_DELAY_MS = { min: 50, max: 2000, step: 25, def: 250 } as const;
+export const SCROLL_STEP = { min: 1, max: 10, step: 1, def: 3 } as const;
+export const SCROLL_MAX_FRAMES = { min: 5, max: 200, step: 5, def: 60 } as const;
+
+/**
+ * Which capture path produced a record. Mirrors `CaptureRecord.kind`.
+ * `edit` comes from `saveEdit(..., replace: false)`, not from a capture;
+ * `scroll` is a stitched scrolling capture (M5 §4), which goes through the same
+ * `finalize()` as everything else and so is an ordinary record in every other
+ * respect.
+ */
+export type CaptureKind = 'region' | 'fullscreen' | 'window' | 'monitor' | 'edit' | 'scroll';
 
 export interface CaptureRecord {
   id: string;
@@ -237,3 +259,89 @@ export interface Rect {
 
 /** Top-level navigation inside the `main` window. */
 export type View = 'capture' | 'history' | 'settings';
+
+/* -------------------------------------------------------------------- OCR */
+
+/**
+ * One line as the engine segmented it, in reading order (M5 §3). A line is not
+ * a paragraph and not a sentence — `Windows.Media.Ocr` splits on the layout it
+ * sees, so a two-column page interleaves. That is why the UI offers the lines
+ * *and* the joined block rather than only one of them.
+ */
+export interface OcrLine {
+  text: string;
+}
+
+/** Result of `ocr_capture`. */
+export interface OcrResult {
+  /** Every line joined with newlines. Empty when nothing was recognised. */
+  text: string;
+  lines: OcrLine[];
+  /** BCP-47 tag of the engine that ran, e.g. `en-US`. */
+  language: string;
+}
+
+/* ---------------------------------------------------- scrolling capture */
+
+/**
+ * Why a scrolling run ended (M5 §4), mirroring `Stop::code` in `scroll.rs`.
+ * Only `end` is the bottom of the content; every other value stopped short.
+ *
+ * This exists to be *read*, not to be branched on — `ScrollOutcome.incomplete`
+ * is the flag that decides how a run is presented, and `message` is the prose.
+ * Anything here that this build has no opinion about is still handled, because
+ * neither of those two depends on recognising the code.
+ */
+export const SCROLL_STOP_REASONS = [
+  'end',
+  'maxFrames',
+  'cancelled',
+  'noOverlap',
+  'resized',
+  'obscured',
+  'pointerMoved',
+  'pointerLost',
+  'wheelBlocked',
+  'heightLimit',
+  'captureFailed'
+] as const;
+
+export type ScrollStopReason = (typeof SCROLL_STOP_REASONS)[number];
+
+export function isScrollStopReason(value: unknown): value is ScrollStopReason {
+  return typeof value === 'string' && (SCROLL_STOP_REASONS as readonly string[]).includes(value);
+}
+
+/** Payload of `scroll://progress`, emitted after every grab. */
+export interface ScrollProgress {
+  /** Frames grabbed, duplicates included. */
+  frames: number;
+  /** Frames actually merged into the image. */
+  stitched: number;
+  /** The run's frame budget, already clamped by Rust. */
+  maxFrames: number;
+  /** Height of the stitch so far, in image pixels. */
+  height: number;
+}
+
+/**
+ * What `start_scroll_capture` produced.
+ *
+ * There is always a `record` — the run finalizes whatever it managed to stitch,
+ * so a cancel and a lost overlap both still hand back an image — and there is
+ * always a `message`. `incomplete` is the one the UI must not ignore: it is
+ * true whenever the run ended before the bottom of the content *or* nothing
+ * scrolled at all, and a truncated stitch is indistinguishable from a complete
+ * one by looking at it.
+ */
+export interface ScrollOutcome {
+  record: CaptureRecord;
+  frames: number;
+  stitched: number;
+  width: number;
+  height: number;
+  reason: ScrollStopReason;
+  /** One finished sentence for the user, populated on success too. */
+  message: string;
+  incomplete: boolean;
+}

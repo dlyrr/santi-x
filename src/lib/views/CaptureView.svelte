@@ -5,17 +5,23 @@
   import { settings } from "$lib/stores/settings.svelte";
   import { history } from "$lib/stores/history.svelte";
   import {
+    cancelScrollCapture,
     captureActiveWindow,
     captureFullscreen,
     captureMonitor,
     captureWindow,
+    errorMessage,
     listMonitors,
     listWindows,
+    onScrollProgress,
     openSaveDir,
     startRegionCapture,
+    startScrollCapture,
     versionedAssetUrl,
     type CaptureRecord,
     type MonitorInfo,
+    type ScrollOutcome,
+    type ScrollProgress,
     type View,
     type WindowInfo
   } from "$lib/api";
@@ -32,6 +38,14 @@
   let pending = $state<string | null>(null);
   let busy = $derived(pending !== null);
 
+  // Scrolling capture (M5 §4). It runs for tens of seconds, so it is the one
+  // capture with live state of its own: the frame count Rust reports and a
+  // cancel that has to reach Rust rather than just clearing a flag here.
+  let scrollTarget = $state<number | null>(null);
+  let scrolling = $state(false);
+  let cancelling = $state(false);
+  let progress = $state<ScrollProgress | null>(null);
+
   let hotkeys = $derived(settings.current?.hotkeys);
   let saveDir = $derived(settings.current?.saveDir ?? "");
   let recent = $derived(history.items.slice(0, 6));
@@ -40,6 +54,22 @@
   onMount(() => {
     void refreshWindows();
     void refreshMonitors();
+  });
+
+  // Subscribed for the life of the view, not just for the life of a run: the
+  // listener has to be up before `start_scroll_capture` is invoked or the first
+  // frames go unheard.
+  $effect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    onScrollProgress((p) => (progress = p)).then((un) => {
+      if (cancelled) un();
+      else unlisten = un;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   });
 
   function label(err: unknown): string {
@@ -96,12 +126,86 @@
     loadingWindows = true;
     try {
       windows = await listWindows();
+      // A picked window that has since been closed would start a run against a
+      // dead handle, so the picker re-homes onto the first live one. Never
+      // mid-run: the list is only a display then, and the target is Rust's.
+      if (!scrolling && !windows.some((w) => w.id === scrollTarget)) {
+        scrollTarget = windows[0]?.id ?? null;
+      }
     } catch (err) {
       toast.error(label(err));
     } finally {
       loadingWindows = false;
     }
   }
+
+  /**
+   * Report what the run produced.
+   *
+   * `incomplete` decides the tone, not the reason code — Rust sets it whenever
+   * the capture stopped short of the bottom *or* nothing scrolled at all, and a
+   * truncated stitch looks exactly like a complete one. `message` is a finished
+   * sentence that already names the frame count and the cause, so all this adds
+   * is the part Rust has no reason to repeat: which file was kept.
+   */
+  function reportScroll(outcome: ScrollOutcome): void {
+    if (outcome.incomplete) {
+      toast.info(
+        `${outcome.message} Kept ${outcome.record.name} — ${outcome.width}×${outcome.height}.`
+      );
+      return;
+    }
+    toast.success(`${outcome.message} ${describe(outcome.record)}.`);
+  }
+
+  async function startScroll(): Promise<void> {
+    const target = scrollTarget;
+    if (pending || target === null) return;
+    pending = "scrolling";
+    scrolling = true;
+    cancelling = false;
+    progress = null;
+    try {
+      reportScroll(await startScrollCapture(target));
+    } catch (err) {
+      toast.error(label(err));
+    } finally {
+      scrolling = false;
+      cancelling = false;
+      progress = null;
+      pending = null;
+    }
+  }
+
+  /**
+   * Cancel has to reach Rust — clearing a flag here would leave the run driving
+   * the wheel over someone else's window. Rust stops at its next poll, keeps
+   * and finalizes what it already stitched, and resolves the original call, so
+   * the minute is not thrown away.
+   */
+  async function cancelScroll(): Promise<void> {
+    if (!scrolling || cancelling) return;
+    cancelling = true;
+    try {
+      await cancelScrollCapture();
+    } catch (err) {
+      // The run is still going. Say so rather than flipping the button back to
+      // a state that claims otherwise.
+      cancelling = false;
+      toast.error(errorMessage(err));
+    }
+  }
+
+  // Nothing has been grabbed yet between the invoke and the first frame — the
+  // target is still being raised to the foreground — so that gap is named
+  // rather than shown as "Frame 0".
+  const scrollStatus = $derived.by(() => {
+    const p = progress;
+    if (!p) return "Starting…";
+    const of = p.maxFrames > 0 ? ` of ${p.maxFrames}` : "";
+    const tall = p.height > 0 ? ` · ${p.height}px tall` : "";
+    return `Frame ${p.frames}${of}${tall}`;
+  });
 
   async function refreshMonitors(): Promise<void> {
     try {
@@ -212,6 +316,67 @@
         <span class="progress" aria-hidden="true"></span>
       </button>
     {/each}
+
+    <!-- Not a button: it holds a picker, and mid-run it holds the Cancel. A run
+         is tens of seconds long, so the frame count and the cancel are the
+         card, not decoration on it. -->
+    <div class="scroller" class:working={scrolling}>
+      <span class="shot-icon"><Icon name="scroll" size={20} /></span>
+      <span class="shot-text">
+        <span class="shot-title">Scrolling capture</span>
+        <span class="shot-desc">
+          {#if scrolling}
+            Leave the mouse alone. The run drives the real pointer, so moving it ends the capture —
+            including reaching for Cancel, which is why Cancel is reachable with Tab and Enter.
+            Either way the frames stitched so far are kept.
+          {:else}
+            Scroll a window a step at a time and stitch the frames into one tall image. It takes
+            over the mouse pointer while it runs. Good on ordinary scrolling content; poor on
+            virtualised lists, parallax, and headers that repeat in every frame.
+          {/if}
+        </span>
+      </span>
+
+      <div class="scroll-controls">
+        {#if scrolling}
+          <span class="scroll-status num" role="status" aria-live="polite">{scrollStatus}</span>
+          <button
+            type="button"
+            class="btn"
+            disabled={cancelling}
+            title="Stop here and keep what has been stitched"
+            onclick={cancelScroll}
+          >
+            {cancelling ? "Stopping…" : "Cancel"}
+          </button>
+        {:else}
+          <select
+            class="select"
+            aria-label="Window to scroll and capture"
+            disabled={busy || windows.length === 0}
+            bind:value={scrollTarget}
+          >
+            {#if windows.length === 0}
+              <option value={null}>No capturable windows</option>
+            {:else}
+              {#each windows as w (w.id)}
+                <option value={w.id}>{w.title || "Untitled window"} — {w.appName}</option>
+              {/each}
+            {/if}
+          </select>
+          <button
+            type="button"
+            class="btn"
+            disabled={busy || scrollTarget === null}
+            onclick={startScroll}
+          >
+            Start
+          </button>
+        {/if}
+      </div>
+
+      <span class="progress" aria-hidden="true"></span>
+    </div>
   </section>
 
   <section class="block">
@@ -385,7 +550,12 @@
     gap: 12px;
   }
 
-  .shot {
+  /* One tile box, two kinds of tile: `.shot` is a button, `.scroller` is a
+     panel with controls inside it. They share the box and nothing else — the
+     hover, press and focus affordances below stay on `.shot`, because clicking
+     the scrolling card itself does nothing. */
+  .shot,
+  .scroller {
     position: relative;
     overflow: hidden;
     display: flex;
@@ -399,11 +569,14 @@
     font: inherit;
     color: var(--text);
     text-align: left;
-    cursor: pointer;
     transition:
       background 140ms ease,
       border-color 140ms ease,
       transform 140ms ease;
+  }
+
+  .shot {
+    cursor: pointer;
   }
 
   .shot:hover:not(:disabled) {
@@ -425,9 +598,40 @@
     opacity: 0.55;
   }
 
-  .shot.working {
+  .shot.working,
+  .scroller.working {
     opacity: 1;
     border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  }
+
+  .scroller {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .scroller .shot-text {
+    flex: 1;
+  }
+
+  .scroll-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+    min-width: 0;
+  }
+
+  /* Window titles are long and arbitrary; the tile must not widen for them. */
+  .scroll-controls .select {
+    max-width: 260px;
+  }
+
+  .scroll-status {
+    font-size: 13px;
+    color: var(--text-dim);
+    white-space: nowrap;
   }
 
   .hero {
@@ -519,7 +723,8 @@
     background: var(--accent);
   }
 
-  .shot.working .progress {
+  .shot.working .progress,
+  .scroller.working .progress {
     animation: sweep 900ms ease-in-out infinite;
   }
 

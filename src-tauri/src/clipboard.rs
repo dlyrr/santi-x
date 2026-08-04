@@ -236,7 +236,10 @@ fn dibv5(img: &RgbaImage) -> Result<Vec<u8>, String> {
 /// optional, and getting it backwards produces a picture with red and blue
 /// exchanged — a wrong answer plausible enough to ship, which is why it is
 /// pinned by a test below.
-fn rgba_to_bgra(img: &RgbaImage) -> Vec<u8> {
+///
+/// `pub(crate)` for `ocr.rs` (M5 §3), which needs the identical swap to build a
+/// `Bgra8` `SoftwareBitmap` and must not grow a second copy of it.
+pub(crate) fn rgba_to_bgra(img: &RgbaImage) -> Vec<u8> {
     let src = img.as_raw();
     let mut out = Vec::with_capacity(src.len());
     for px in src.chunks_exact(4) {

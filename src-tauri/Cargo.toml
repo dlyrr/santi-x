@@ -42,14 +42,28 @@ base64 = "0.22"
 # Registry is the rename migration in `migrate.rs`: the stale `Run` value the
 # old "Nimbus" autostart registration left behind is read and deleted through
 # the API rather than by shelling out to `reg.exe`.
+#
+# The WinRT namespaces at the bottom are M5 §3, the offline OCR in `ocr.rs`.
+# `Globalization` is not on that milestone's list but is unavoidable:
+# `TryCreateFromLanguage` takes a `Windows.Globalization.Language` and
+# `RecognizerLanguage` hands one back. `Win32_System_Com` is there for
+# `CoIncrementMTAUsage` alone — WinRT activation from a `spawn_blocking` pool
+# thread needs an apartment, and that is the one way to get one without
+# initialising (and then having to un-initialise) a thread we do not own.
 windows = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_System_Com",
   "Win32_System_DataExchange",
   "Win32_System_Memory",
   "Win32_System_Registry",
   "Win32_System_Threading",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
+  "Foundation_Collections",
+  "Globalization",
+  "Graphics_Imaging",
+  "Media_Ocr",
+  "Storage_Streams",
 ] }
 tauri-plugin-autostart = "2.5.1"

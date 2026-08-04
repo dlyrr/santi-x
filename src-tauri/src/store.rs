@@ -67,6 +67,19 @@ impl Default for Hotkeys {
     }
 }
 
+/// # Two layers of defaulting, and why both stay
+///
+/// The container-level `default` is the one that actually fires: a missing key
+/// is taken from [`Settings::default()`], field by field. It is what lets an M1
+/// `settings.json` still load — `save_dir`, `filename_pattern`, `theme` and
+/// `hotkeys` have no field-level default of their own and rely on it entirely.
+///
+/// The per-field `#[serde(default = "…")]` attributes below are therefore
+/// *redundant* today. They are kept because they are the layer that survives
+/// someone removing the container attribute, and because a field whose default
+/// is not the zero value should say so where it is declared rather than only in
+/// a `Default` impl fifty lines away. `tests::an_empty_settings_file_is_…`
+/// fails if either layer is removed AND the other does not cover it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -126,6 +139,23 @@ pub struct Settings {
     /// hence the named default.
     #[serde(default = "default_true")]
     pub capture_cursor: bool,
+    /// M5 §4. Scrolling capture: settle time between wheel steps, wheel notches
+    /// per step, and the hard frame budget.
+    ///
+    /// All three name their default. A bare `#[serde(default)]` would hand an
+    /// existing `settings.json` `0`, `0` and `0` — a zero settle delay, a wheel
+    /// step that scrolls nothing and a run that stops before it starts — so the
+    /// feature would arrive broken on every machine that already has one.
+    ///
+    /// Read in exactly one place, `scroll.rs`, which clamps them at the point of
+    /// use; unlike `theme` and `loupe_zoom` there is nothing else downstream that
+    /// an out-of-range value could reach.
+    #[serde(default = "default_scroll_delay_ms")]
+    pub scroll_delay_ms: u32,
+    #[serde(default = "default_scroll_step")]
+    pub scroll_step: i32,
+    #[serde(default = "default_scroll_max_frames")]
+    pub scroll_max_frames: u32,
     pub hotkeys: Hotkeys,
 }
 
@@ -159,6 +189,18 @@ fn default_loupe_zoom() -> u32 {
     8
 }
 
+fn default_scroll_delay_ms() -> u32 {
+    250
+}
+
+fn default_scroll_step() -> i32 {
+    3
+}
+
+fn default_scroll_max_frames() -> u32 {
+    60
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -182,6 +224,9 @@ impl Default for Settings {
             show_capture_preview: true,
             loupe_zoom: default_loupe_zoom(),
             capture_cursor: true,
+            scroll_delay_ms: default_scroll_delay_ms(),
+            scroll_step: default_scroll_step(),
+            scroll_max_frames: default_scroll_max_frames(),
             hotkeys: Hotkeys::default(),
         }
     }
@@ -196,7 +241,7 @@ pub struct CaptureRecord {
     pub thumb: String,
     pub width: u32,
     pub height: u32,
-    /// "region" | "fullscreen" | "window" | "monitor" | "edit"
+    /// "region" | "fullscreen" | "window" | "monitor" | "edit" | "scroll"
     pub kind: String,
     pub created_at: i64,
     pub size_bytes: u64,
@@ -433,4 +478,117 @@ pub fn resolve_filename(pattern: &str, kind: &str, dir: &Path) -> PathBuf {
         n += 1;
     }
     candidate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `settings.json` exactly as M2.11 wrote it — no `scroll*` keys at all.
+    /// This is the literal shape on a machine that has been running the app
+    /// since before M5, custom hotkeys and save directory included.
+    ///
+    /// `r##"…"##`, not `r#"…"#`: the colour literal contains `"#`, which would
+    /// otherwise close the raw string in the middle of the JSON.
+    const M2_11_SETTINGS: &str = r##"{
+      "saveDir": "C:\\Users\\santi\\Pictures\\Nimbus",
+      "filenamePattern": "{kind}_{yyyy}-{MM}-{dd}_{HH}-{mm}-{ss}",
+      "saveToDisk": true,
+      "copyToClipboard": true,
+      "openFolderAfter": false,
+      "hideWindowOnCapture": false,
+      "theme": "sharex",
+      "openEditorAfter": false,
+      "editorDefaultColor": "#f2555a",
+      "editorDefaultStroke": 4,
+      "annotateInOverlay": true,
+      "useLowLevelHotkeys": true,
+      "startHidden": true,
+      "launchAtLogin": true,
+      "showCapturePreview": true,
+      "loupeZoom": 2,
+      "captureCursor": true,
+      "hotkeys": {
+        "region": "Shift+Super+S",
+        "fullscreen": "PrintScreen",
+        "activeWindow": "Alt+PrintScreen"
+      }
+    }"##;
+
+    /// M5 §4 added three fields to a struct users already have on disk. The
+    /// risk is not that the file fails to parse — `#[serde(default)]` on the
+    /// container guarantees it will — but that the three new fields arrive as
+    /// `0`, `0`, `0`: a zero settle delay, a wheel step that scrolls nothing
+    /// and a frame budget clamped up from below. That is a feature that ships
+    /// broken to every existing install, and it is invisible until someone
+    /// tries it.
+    #[test]
+    fn an_m2_11_settings_file_still_loads_and_gains_the_scroll_defaults() {
+        let s: Settings = serde_json::from_str(M2_11_SETTINGS).expect("M2.11 settings must parse");
+
+        // Everything the user actually configured survives untouched.
+        assert_eq!(s.save_dir, r"C:\Users\santi\Pictures\Nimbus");
+        assert_eq!(s.theme, "sharex");
+        assert_eq!(s.loupe_zoom, 2);
+        assert_eq!(s.hotkeys.region, "Shift+Super+S");
+        assert_eq!(s.hotkeys.fullscreen, "PrintScreen");
+        assert_eq!(s.hotkeys.active_window, "Alt+PrintScreen");
+        assert_eq!(s.filename_pattern, "{kind}_{yyyy}-{MM}-{dd}_{HH}-{mm}-{ss}");
+        assert!(s.save_to_disk && s.copy_to_clipboard && s.capture_cursor);
+        assert!(s.annotate_in_overlay && s.start_hidden && s.launch_at_login);
+        assert!(s.show_capture_preview && s.use_low_level_hotkeys);
+        assert!(!s.open_editor_after && !s.open_folder_after && !s.hide_window_on_capture);
+
+        // And the three new ones arrive at their documented defaults, not zero.
+        assert_eq!(s.scroll_delay_ms, 250);
+        assert_eq!(s.scroll_step, 3);
+        assert_eq!(s.scroll_max_frames, 60);
+    }
+
+    /// The general form of the rule, so the next field added to `Settings` is
+    /// caught too: an EMPTY object must deserialize to exactly `default()`.
+    /// A field that forgot its named default would come back `0`/`""`/`false`
+    /// here while `Default` still had the real value.
+    #[test]
+    fn an_empty_settings_file_is_indistinguishable_from_defaults() {
+        let from_empty: Settings = serde_json::from_str("{}").expect("{} must parse");
+        let fresh = Settings::default();
+        assert_eq!(
+            serde_json::to_value(&from_empty).unwrap(),
+            serde_json::to_value(&fresh).unwrap(),
+            "a missing field is defaulting to a zero value rather than to its real default"
+        );
+    }
+
+    /// No numeric setting may default to zero. Every one of them is either a
+    /// duration, a count or a step, and zero is a broken value for all three —
+    /// this is the exact failure mode M5 §4's named defaults exist to prevent.
+    #[test]
+    fn no_numeric_setting_defaults_to_zero() {
+        let s = Settings::default();
+        assert_ne!(s.editor_default_stroke, 0);
+        assert_ne!(s.loupe_zoom, 0);
+        assert_ne!(s.scroll_delay_ms, 0);
+        assert_ne!(s.scroll_step, 0);
+        assert_ne!(s.scroll_max_frames, 0);
+    }
+
+    /// History is a separate file and M5 did not touch `CaptureRecord`, but the
+    /// new `"scroll"` kind travels in it. An existing record must still load,
+    /// and a `scroll` one must round-trip.
+    #[test]
+    fn existing_history_records_still_load_beside_scroll_ones() {
+        let raw = r#"[
+          {"id":"1785835580740-13","name":"region_2026-08-04_04-26-20.png",
+           "path":"C:\\Users\\santi\\Pictures\\Nimbus\\region_2026-08-04_04-26-20.png",
+           "thumb":"C:\\thumbs\\1785835580740-13.png","width":316,"height":72,
+           "kind":"region","createdAt":1785835580747,"sizeBytes":5821,
+           "saved":true,"copied":true}
+        ]"#;
+        let records: Vec<CaptureRecord> = serde_json::from_str(raw).expect("history must parse");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, "region");
+        assert_eq!(records[0].width, 316);
+        assert!(records[0].saved && records[0].copied);
+    }
 }

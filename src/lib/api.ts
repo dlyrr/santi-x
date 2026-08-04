@@ -15,7 +15,10 @@ import type {
   FreezeInfo,
   HotkeyStatus,
   MonitorInfo,
+  OcrResult,
   Rect,
+  ScrollOutcome,
+  ScrollProgress,
   Settings,
   WindowInfo
 } from '$lib/types';
@@ -34,14 +37,25 @@ export type {
   Hotkeys,
   HotkeyStatus,
   MonitorInfo,
+  OcrLine,
+  OcrResult,
   Rect,
+  ScrollOutcome,
+  ScrollProgress,
+  ScrollStopReason,
   Settings,
   Theme,
   View,
   WindowInfo,
   WindowRect
 } from '$lib/types';
-export { THEME_STORAGE_KEY } from '$lib/types';
+export {
+  isScrollStopReason,
+  SCROLL_DELAY_MS,
+  SCROLL_MAX_FRAMES,
+  SCROLL_STEP,
+  THEME_STORAGE_KEY
+} from '$lib/types';
 
 /* ------------------------------------------------------------------ errors */
 
@@ -176,6 +190,38 @@ export async function captureWindow(id: number): Promise<CaptureRecord> {
   return invoke<CaptureRecord>('capture_window', { id });
 }
 
+/* ------------------------------------------------------ scrolling capture */
+
+/**
+ * Scroll the window with this `list_windows` id and stitch the frames into one
+ * tall capture (M5 §4).
+ *
+ * Long-running by construction — `scrollMaxFrames` × `scrollDelayMs` is tens of
+ * seconds — so the promise is not the only feedback: Rust emits
+ * `scroll://progress` after every grab, and the UI must show it.
+ *
+ * It resolves for *every* stop reason, including a cancel and a lost overlap,
+ * because each of those still finalizes the frames already stitched. Resolving
+ * is therefore not the same as succeeding: read `incomplete` before saying so.
+ * It rejects only when the run could not start or produced nothing.
+ *
+ * The run drives the real mouse pointer, so moving the mouse ends it — that is
+ * the documented escape hatch, not a fault.
+ */
+export async function startScrollCapture(id: number): Promise<ScrollOutcome> {
+  return invoke<ScrollOutcome>('start_scroll_capture', { id });
+}
+
+/**
+ * Ask the run in flight to stop. It keeps and finalizes whatever was already
+ * stitched, then resolves the original call with `reason: 'cancelled'` — a
+ * cancel is "stop here", not "throw away the last thirty seconds". Infallible
+ * on the Rust side, and a no-op when nothing is running.
+ */
+export async function cancelScrollCapture(): Promise<void> {
+  await invoke<void>('cancel_scroll_capture');
+}
+
 /* ------------------------------------------------------------------ region */
 
 /**
@@ -271,6 +317,21 @@ export async function copyEdit(png: string): Promise<void> {
 
 export async function closeEditor(): Promise<void> {
   await invoke<void>('close_editor');
+}
+
+/* --------------------------------------------------------------------- OCR */
+
+/**
+ * Read the text out of a capture with the offline Windows OCR engine (M5 §3).
+ * Rust reads the file from disk, so this rejects for a record with no `path` —
+ * `saveToDisk` was off and there is nothing to recognise. Check before offering
+ * the action rather than letting the user discover it in an error.
+ *
+ * A recognition that finds nothing is a *success* with an empty `text` and no
+ * lines, not a rejection. That is a real state the UI must name.
+ */
+export async function ocrCapture(id: string): Promise<OcrResult> {
+  return invoke<OcrResult>('ocr_capture', { id });
 }
 
 /* ----------------------------------------------------------------- preview */
@@ -386,6 +447,18 @@ export function onCapturePreview(cb: (record: CaptureRecord) => void): Promise<U
  */
 export function onPreviewHidden(cb: () => void): Promise<UnlistenFn> {
   return listen<null>('preview://hide', () => cb());
+}
+
+/**
+ * A scrolling run has captured another frame, or moved on to stitching or
+ * saving (M5 §4). Emitted to every window, so the capture view hears it whether
+ * or not it started the run.
+ *
+ * This is the whole reason the feature is usable: without it a minute-long run
+ * is a frozen button. Only `frames` is guaranteed — treat the rest as hints.
+ */
+export function onScrollProgress(cb: (progress: ScrollProgress) => void): Promise<UnlistenFn> {
+  return listen<ScrollProgress>('scroll://progress', (e) => cb(e.payload));
 }
 
 export function onCaptureError(cb: (message: string) => void): Promise<UnlistenFn> {

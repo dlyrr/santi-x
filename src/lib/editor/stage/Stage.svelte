@@ -517,6 +517,10 @@
         return { kind: "pen", color: opts.color, stroke: opts.stroke, points: [at] };
       case "highlight":
         return { kind: "highlight", color: opts.color, stroke: opts.stroke, rect };
+      // Colour and stroke are carried because `ShapeBase` requires them, but
+      // the renderer ignores both for a redaction — including in erase mode,
+      // where the fill comes from the surrounding pixels (M5 §2). Passing the
+      // live opts keeps the shape uniform with the rest.
       case "redact":
         return {
           kind: "redact",
@@ -526,11 +530,6 @@
           mode: opts.redactMode,
           amount: opts.redactAmount
         };
-      // Colour and stroke are carried because `ShapeBase` requires them, but
-      // the renderer ignores both: an erase fills from the surrounding pixels
-      // (M2.11 §2). Passing the live opts keeps the shape uniform with the rest.
-      case "erase":
-        return { kind: "erase", color: opts.color, stroke: opts.stroke, rect };
       case "step":
         return {
           kind: "step",
@@ -571,7 +570,6 @@
       case "ellipse":
       case "highlight":
       case "redact":
-      case "erase":
         doc.updateShape(d.id, { rect: rectFromPoints(d.start, p, e.shiftKey) });
         break;
       case "pen": {
@@ -599,7 +597,6 @@
       case "ellipse":
       case "highlight":
       case "redact":
-      case "erase":
         return Math.max(Math.abs(shape.rect.width), Math.abs(shape.rect.height));
       default:
         // Pen and step are placed, not spanned: a tap is a legitimate result.

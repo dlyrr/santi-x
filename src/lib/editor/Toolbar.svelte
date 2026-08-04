@@ -20,7 +20,6 @@
     text: "text",
     highlight: "highlighter",
     redact: "droplet",
-    erase: "eraser",
     step: "step",
     crop: "crop"
   };
@@ -41,7 +40,7 @@
   import Icon from "$lib/components/Icon.svelte";
   import ColorPicker from "$lib/editor/ColorPicker.svelte";
   import { optionsForKind, toolById } from "$lib/editor/tools";
-  import type { ToolOption, ToolOptions } from "$lib/editor/tools";
+  import type { RedactMode, ToolOption, ToolOptions } from "$lib/editor/tools";
   import type { ShapeKind } from "$lib/editor/doc.svelte";
 
   interface Props {
@@ -65,6 +64,18 @@
     onRedo: () => void;
     onDelete: () => void;
     onResetCrop: () => void;
+    /**
+     * M5 §3. False when the capture has no file on disk — `ocr_capture` reads
+     * the PNG back, exactly as the Lightbox and CaptureCard actions do, so with
+     * `saveToDisk` off there is nothing to read.
+     */
+    canOcr: boolean;
+    /**
+     * True when the document has unsaved edits. OCR runs against the *file*, so
+     * the button says so rather than quietly reading a stale image.
+     */
+    ocrStale?: boolean;
+    onOcr: () => void;
   }
 
   let {
@@ -80,8 +91,27 @@
     onUndo,
     onRedo,
     onDelete,
-    onResetCrop
+    onResetCrop,
+    canOcr,
+    ocrStale = false,
+    onOcr
   }: Props = $props();
+
+  /**
+   * Short enough for the tooltip, which is `white-space: nowrap` and centred on
+   * its button — and this button sits in `.actions`, hard against the right end
+   * of the bar, so a long one would hang off the window. The full sentence goes
+   * in `title` instead, where the platform wraps and repositions it.
+   */
+  const ocrTip = $derived(!canOcr ? "Not on disk" : ocrStale ? "Saved file" : "Extract text");
+
+  const ocrTitle = $derived(
+    !canOcr
+      ? "This capture was never written to disk, so there is no image to read text from"
+      : ocrStale
+        ? "Extract text — reads the saved file, so unsaved edits are not included"
+        : "Read the text out of this capture"
+  );
 
   // With Select active the options bar describes whatever is selected, so the
   // same colour/width controls edit an existing shape instead of a future one.
@@ -95,6 +125,26 @@
 
   const has = (option: ToolOption): boolean => shown.includes(option);
   const empty = $derived(shown.length === 0);
+
+  /**
+   * The three redaction modes and their keys (M5 §2). The keys are the ones
+   * `tools.ts` maps — `X` selects Redact in erase mode now that the smart
+   * eraser is not a tool of its own — and they are shown because a mode is the
+   * only thing on this bar a shortcut lands on.
+   */
+  const REDACT_MODES: readonly { mode: RedactMode; label: string; key: string }[] = [
+    { mode: "blur", label: "Blur", key: "B" },
+    { mode: "pixelate", label: "Pixelate", key: "P" },
+    { mode: "erase", label: "Smart eraser", key: "X" }
+  ];
+
+  /**
+   * The amount means nothing in erase mode — that fill comes entirely from the
+   * image — so the slider goes rather than sitting there dead (M5 §2). Its slot
+   * keeps its width either way: a control that appears and disappears mid-bar
+   * shoves everything beside it sideways under the pointer that just clicked.
+   */
+  const hasAmount = $derived(has("redactAmount") && opts.redactMode !== "erase");
 
   /**
    * Spread onto every slider. `pointerup` is the normal end; `pointercancel`
@@ -191,45 +241,47 @@
 
     {#if has("redactMode")}
       <div class="seg" role="group" aria-label="Redaction mode">
-        <button
-          type="button"
-          class="seg-btn"
-          class:on={opts.redactMode === "blur"}
-          aria-pressed={opts.redactMode === "blur"}
-          onclick={() => onOptions({ redactMode: "blur" })}
-        >
-          Blur
-        </button>
-        <button
-          type="button"
-          class="seg-btn"
-          class:on={opts.redactMode === "pixelate"}
-          aria-pressed={opts.redactMode === "pixelate"}
-          onclick={() => onOptions({ redactMode: "pixelate" })}
-        >
-          Pixelate
-        </button>
+        {#each REDACT_MODES as m (m.mode)}
+          <button
+            type="button"
+            class="seg-btn"
+            class:on={opts.redactMode === m.mode}
+            aria-pressed={opts.redactMode === m.mode}
+            aria-label="{m.label} ({m.key})"
+            onclick={() => onOptions({ redactMode: m.mode })}
+          >
+            {m.label}
+          </button>
+        {/each}
       </div>
     {/if}
 
     {#if has("redactAmount")}
-      <label class="ctl">
-        <span class="ctl-label">
-          {opts.redactMode === "blur" ? "Radius" : "Blocks"}
-        </span>
-        <input
-          class="slider"
-          type="range"
-          min="2"
-          max="40"
-          step="1"
-          value={opts.redactAmount}
-          aria-label="Redaction amount"
-          {...sliderGesture}
-          oninput={(e) => onOptions({ redactAmount: e.currentTarget.valueAsNumber })}
-        />
-        <output class="ctl-value tnum">{opts.redactAmount}</output>
-      </label>
+      <!-- Fixed-width slot: see `hasAmount`. The slider leaves in erase mode,
+           the width does not. -->
+      <div class="amount">
+        {#if hasAmount}
+          <label class="ctl">
+            <span class="ctl-label">
+              {opts.redactMode === "blur" ? "Radius" : "Blocks"}
+            </span>
+            <input
+              class="slider"
+              type="range"
+              min="2"
+              max="40"
+              step="1"
+              value={opts.redactAmount}
+              aria-label="Redaction amount"
+              {...sliderGesture}
+              oninput={(e) => onOptions({ redactAmount: e.currentTarget.valueAsNumber })}
+            />
+            <output class="ctl-value tnum">{opts.redactAmount}</output>
+          </label>
+        {:else}
+          <span class="hint">Fills from nearby pixels</span>
+        {/if}
+      </div>
     {/if}
 
     {#if tool === "crop"}
@@ -252,6 +304,22 @@
   <span class="rule" aria-hidden="true"></span>
 
   <div class="actions">
+    <!-- M5 §3. Sits with the actions, not the tools: it reads the capture
+         rather than changing it, so it never becomes the active tool. -->
+    <div class="slot">
+      <button
+        type="button"
+        class="tool"
+        aria-label="Extract text"
+        title={ocrTitle}
+        disabled={!canOcr}
+        onclick={onOcr}
+      >
+        <Icon name="scan" size={16} />
+      </button>
+      <span class="tip" aria-hidden="true">{ocrTip}</span>
+    </div>
+    <span class="rule" aria-hidden="true"></span>
     <div class="slot">
       <button
         type="button"
@@ -320,6 +388,13 @@
     height: 24px;
     flex: none;
     background: var(--border);
+  }
+
+  /* The bar's own gap is 12px, so the outer rules sit in air. Inside `.actions`
+     the gap is 2px, which would leave the Extract-text divider touching the
+     buttons either side of it. */
+  .actions .rule {
+    margin: 0 5px;
   }
 
   .slot {
@@ -449,6 +524,17 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    flex: none;
+  }
+
+  /* Wide enough for the label + slider + readout it holds in blur and pixelate
+     mode, and it keeps that width in erase mode where there is no amount to
+     set. Sized so the substitute hint fits inside it rather than widening it. */
+  .amount {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 176px;
     flex: none;
   }
 

@@ -9,6 +9,7 @@
     type CaptureRecord
   } from '$lib/api';
   import { history } from '$lib/stores/history.svelte';
+  import OcrPanel from '$lib/components/OcrPanel.svelte';
   import { toast } from '$lib/components/Toast.svelte';
 
   interface Props {
@@ -23,6 +24,7 @@
   let scrimEl: HTMLDivElement | undefined = $state();
   let dialogEl: HTMLDivElement | undefined = $state();
   let imgBroken = $state(false);
+  let ocrOpen = $state(false);
 
   const record = $derived(records[index] ?? records[records.length - 1] ?? null);
   const hasFile = $derived(!!record && record.saved && record.path !== '');
@@ -39,6 +41,14 @@
   $effect(() => {
     void fullSrc;
     imgBroken = false;
+  });
+
+  // The OCR panel describes one exact picture. Moving to another capture, or
+  // the editor rewriting this one in place, would leave text on screen that no
+  // longer belongs to the image behind it.
+  $effect(() => {
+    void fullSrc;
+    ocrOpen = false;
   });
 
   $effect(() => {
@@ -304,11 +314,28 @@
           <button type="button" class="btn" disabled={!hasFile} onclick={doReveal}>
             Show in folder
           </button>
+          <!-- Disabled without a file for the same reason as the rest: OCR reads
+               the PNG off disk, and `saveToDisk` off means there is none. -->
+          <button
+            type="button"
+            class="btn"
+            disabled={!hasFile}
+            title="Read the text out of this capture"
+            onclick={() => (ocrOpen = true)}
+          >
+            Extract text
+          </button>
           <button type="button" class="btn btn-danger" onclick={doDelete}>Delete</button>
         </div>
       </footer>
     </div>
   </div>
+
+  <!-- Outside the dialog on purpose: the lightbox traps Tab and reads the arrow
+       keys on `dialogEl`, and the panel is the modal on top now. -->
+  {#if ocrOpen && hasFile}
+    <OcrPanel {record} onclose={() => (ocrOpen = false)} />
+  {/if}
 {/if}
 
 <style>

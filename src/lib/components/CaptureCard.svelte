@@ -9,6 +9,7 @@
     type CaptureRecord
   } from '$lib/api';
   import { history } from '$lib/stores/history.svelte';
+  import OcrPanel from '$lib/components/OcrPanel.svelte';
   import { toast } from '$lib/components/Toast.svelte';
 
   interface Props {
@@ -20,6 +21,7 @@
   let { record, onopen, ondeleted }: Props = $props();
 
   let thumbBroken = $state(false);
+  let ocrOpen = $state(false);
 
   const hasFile = $derived(record.saved && record.path !== '');
   // Versioned: an edit saved over its original keeps the same thumbnail path,
@@ -29,10 +31,12 @@
   );
 
   // A rewritten capture is a new picture in the same slot, so the broken-image
-  // flag must not survive it.
+  // flag must not survive it — and neither may text extracted from the picture
+  // it replaced.
   $effect(() => {
     void thumbSrc;
     thumbBroken = false;
+    ocrOpen = false;
   });
 
   function relativeTime(ms: number): string {
@@ -95,6 +99,13 @@
     } catch (err) {
       toast.error(String(err));
     }
+  }
+
+  // No round trip of its own: the panel runs `ocr_capture` itself, so it can own
+  // the working state instead of the card holding a spinner it cannot explain.
+  function doExtractText(event: MouseEvent) {
+    event.stopPropagation();
+    ocrOpen = true;
   }
 
   async function doDelete(event: MouseEvent) {
@@ -243,6 +254,36 @@
         </svg>
       </button>
 
+      <!-- OCR reads the PNG off disk, so this is dead without one, exactly like
+           the four actions above it. -->
+      <button
+        type="button"
+        class="act"
+        title="Extract text"
+        aria-label="Extract text from {record.name}"
+        disabled={!hasFile}
+        onclick={doExtractText}
+      >
+        <svg
+          viewBox="0 0 16 16"
+          width="16"
+          height="16"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M2.5 5.75v-2.25a1 1 0 0 1 1-1h2.25" />
+          <path d="M10.25 2.5h2.25a1 1 0 0 1 1 1v2.25" />
+          <path d="M13.5 10.25v2.25a1 1 0 0 1-1 1h-2.25" />
+          <path d="M5.75 13.5H3.5a1 1 0 0 1-1-1v-2.25" />
+          <path d="M5.25 6.5h5.5" />
+          <path d="M5.25 9.5h3.5" />
+        </svg>
+      </button>
+
       <button
         type="button"
         class="act danger"
@@ -282,6 +323,12 @@
     </span>
   </div>
 </div>
+
+<!-- Portals itself out to <body>, so the card's hover lift cannot become the
+     containing block for its fixed scrim. -->
+{#if ocrOpen && hasFile}
+  <OcrPanel {record} onclose={() => (ocrOpen = false)} />
+{/if}
 
 <style>
   .card {

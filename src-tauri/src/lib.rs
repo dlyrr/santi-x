@@ -4,8 +4,10 @@ mod cursor;
 mod editor;
 mod hotkeys;
 mod migrate;
+mod ocr;
 mod overlay;
 mod preview;
+mod scroll;
 mod store;
 
 use std::fs;
@@ -806,6 +808,7 @@ pub fn run() {
             app.manage(CaptureFlags::default());
             app.manage(overlay::OverlayState::default());
             app.manage(preview::PreviewState::default());
+            app.manage(scroll::ScrollState::default());
 
             // santi.sharex starts to tray, so the tray icon is the *only* way in. A
             // tray that failed to build would leave the user with no icon and
@@ -923,6 +926,9 @@ pub fn run() {
             editor::close_editor,
             preview::hide_capture_preview,
             preview::get_preview_record,
+            ocr::ocr_capture,
+            scroll::start_scroll_capture,
+            scroll::cancel_scroll_capture,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

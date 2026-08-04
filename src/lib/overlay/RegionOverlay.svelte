@@ -1122,6 +1122,10 @@
         return { kind: "pen", color: opts.color, stroke: opts.stroke, points: [at] };
       case "highlight":
         return { kind: "highlight", color: opts.color, stroke: opts.stroke, rect };
+      // Colour and stroke are carried because `ShapeBase` requires them, but
+      // the renderer ignores both — a redaction replaces pixels rather than
+      // drawing with them. `amount` is likewise inert in erase mode (M5 §2);
+      // carrying it anyway means switching modes keeps the amount it had.
       case "redact":
         return {
           kind: "redact",
@@ -1131,11 +1135,6 @@
           mode: opts.redactMode,
           amount: opts.redactAmount
         };
-      // Colour and stroke are carried because `ShapeBase` requires them, but
-      // the renderer ignores both: an erase fills from the surrounding pixels
-      // (M2.11 §2). Passing the live opts keeps the shape uniform with the rest.
-      case "erase":
-        return { kind: "erase", color: opts.color, stroke: opts.stroke, rect };
       case "step":
         return { kind: "step", color: opts.color, stroke: opts.stroke, at, n: doc.nextStepNumber };
       default:
@@ -1169,7 +1168,6 @@
       case "ellipse":
       case "highlight":
       case "redact":
-      case "erase":
         doc.updateShape(d.id, { rect: rectFromPoints(d.start, p, shift) });
         break;
       case "pen":
@@ -1190,7 +1188,6 @@
       case "ellipse":
       case "highlight":
       case "redact":
-      case "erase":
         return Math.max(Math.abs(shape.rect.width), Math.abs(shape.rect.height));
       default:
         // Pen and step are placed, not spanned: a tap is a legitimate result.
@@ -1538,9 +1535,10 @@
   }
 
   /**
-   * The fields of `patch` the selected shape actually owns. An erase owns none
-   * of them — its fill comes from the image (M2.11 §2) — and every other kind
-   * drops whatever the renderer would ignore.
+   * The fields of `patch` the selected shape actually owns — every kind drops
+   * whatever the renderer would ignore. A redaction takes the mode and the
+   * amount and nothing else; in erase mode the amount is inert, but the bar
+   * hides that slider (M5 §2) so it never arrives.
    */
   function shapeFields(kind: ShapeKind, patch: Partial<ToolOptions>): ShapePatch {
     switch (kind) {
@@ -1551,8 +1549,6 @@
         return prune({ color: patch.color, size: patch.textSize });
       case "redact":
         return prune({ mode: patch.redactMode, amount: patch.redactAmount });
-      case "erase":
-        return {};
       default:
         return prune({ color: patch.color, stroke: patch.stroke });
     }
@@ -1568,12 +1564,12 @@
     /*
      * Nothing survived the filter, so this control does not describe the
      * selected shape at all — the Region tool keeps colour and stroke on the bar
-     * whatever is selected, and an erase answers to neither.
+     * whatever is selected, and a redaction answers to neither.
      *
      * Bailing BEFORE `beginDrag` and `updateShape` is the point: both push an
      * undo entry, and an entry that restores identical pixels is worse than no
      * entry — Ctrl+Z after picking a colour would appear to do nothing instead
-     * of removing the erase, and the capture would count as edited.
+     * of removing the redaction, and the capture would count as edited.
      */
     if (Object.keys(next).length === 0) return;
     if (optionDrag && !doc.dragging) doc.beginDrag("restyle");
@@ -1803,8 +1799,8 @@
     // `V` for Region. Checked last so a modifier combination can never land on
     // one. Live in every phase the bar is (M2.6 §3), because since M2.7 §3 the
     // tool is what decides whether the next drag selects or draws.
-    // `B`/`P` both land on Redact and carry the mode with them, the way ShareX's
-    // separate Blur and Pixelate tools do.
+    // `B`, `P` and `X` all land on Redact and carry the mode with them: ShareX's
+    // separate Blur and Pixelate tools, plus the eraser M5 §2 folded in.
     const hit = toolHitForKey(key);
     if (hit && OVERLAY_TOOL_IDS.has(hit.tool.id)) {
       e.preventDefault();

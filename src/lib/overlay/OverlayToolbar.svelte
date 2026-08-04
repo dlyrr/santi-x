@@ -45,9 +45,10 @@
     { label: "Shapes", tools: ["rect", "ellipse", "line", "arrow"] },
     { label: "Drawing", tools: ["pen", "highlight"] },
     { label: "Text", tools: ["text", "step"] },
-    // Content removal, not shapes: both replace what was there rather than draw
-    // on top of it (M2.11 §4).
-    { label: "Redaction", tools: ["redact", "erase"] }
+    // Content removal, not a shape: it replaces what was there rather than
+    // drawing on top of it. One button since M5 §2 — blur, pixelate and the
+    // smart eraser are three modes of it, not three tools.
+    { label: "Redaction", tools: ["redact"] }
   ];
 
   const TOOL_GROUPS: readonly { label: string; tools: readonly ToolSpec[] }[] = GROUPS.map((g) => ({
@@ -71,7 +72,7 @@
   import Icon from "$lib/components/Icon.svelte";
   import { PRESETS } from "$lib/editor/ColorPicker.svelte";
   import { toolById } from "$lib/editor/tools";
-  import type { ToolOption, ToolOptions } from "$lib/editor/tools";
+  import type { RedactMode, ToolOption, ToolOptions } from "$lib/editor/tools";
 
   interface Props {
     /** Active tool; `REGION_TOOL` is the default and means "drag out the region". */
@@ -138,19 +139,38 @@
   const has = (option: ToolOption): boolean => shown.includes(option);
 
   /**
-   * Smart eraser is the first overlay tool with no options at all — it takes its
-   * fill from the image, so there is nothing to style (M2.11 §2).
+   * THE REFLOW TRAP, first hit by the smart eraser in M2.11 and still the rule
+   * for anything that comes and goes from this bar.
    *
-   * The Style group is still rendered, carrying a hint instead of controls, and
-   * this is not cosmetic. The bar is centred on the top edge
-   * (`left: 50%; translateX(-50%)`), so its width is shared out equally to both
-   * sides: folding the group away entirely took ~220px out of the middle of the
-   * bar and slid every tool button ~110px sideways *at the moment the eraser was
-   * clicked*, leaving the pointer over some other tool's button and its tooltip.
-   * Keeping the slot occupied holds the switch to the same small reflow every
-   * other tool change already causes.
+   * The bar is centred on the top edge (`left: 50%; translateX(-50%)`), so its
+   * width is shared out equally to both sides: dropping a ~220px group out of
+   * the middle slid every tool button ~110px sideways *at the moment the button
+   * was clicked*, leaving the pointer over some other tool and its tooltip.
+   *
+   * So a group that has nothing to show renders a hint at roughly its own width
+   * instead of folding away. As of M5 §2 every tool the overlay offers has
+   * options — the eraser is a redaction mode now, not an optionless tool — so
+   * this stands as the guard for the next one rather than as live UI.
    */
   const hasOptions = $derived(shown.length > 0);
+
+  /**
+   * The three redaction modes (M5 §2) and the keys that select them. `X` used
+   * to be the standalone smart eraser; it now lands on Redact in erase mode.
+   */
+  const REDACT_MODES: readonly { mode: RedactMode; label: string; key: string }[] = [
+    { mode: "blur", label: "Blur", key: "B" },
+    { mode: "pixelate", label: "Pixelate", key: "P" },
+    { mode: "erase", label: "Smart eraser", key: "X" }
+  ];
+
+  /**
+   * The amount means nothing in erase mode — that fill comes entirely from the
+   * image — so the slider goes rather than sitting there dead. Its slot holds
+   * its width across the switch, for the reason above: this is exactly the kind
+   * of mid-bar control whose disappearance would shove the strip sideways.
+   */
+  const hasAmount = $derived(has("redactAmount") && opts.redactMode !== "erase");
 
   /**
    * Spread onto every slider, same as the editor's toolbar. `pointerup` is the
@@ -441,45 +461,46 @@
 
       {#if has("redactMode")}
         <div class="seg" role="group" aria-label="Redaction mode">
-          <button
-            type="button"
-            class="seg-btn"
-            class:on={opts.redactMode === "blur"}
-            aria-pressed={opts.redactMode === "blur"}
-            onpointerdown={keepFocus}
-            onclick={() => onOptions({ redactMode: "blur" })}
-          >
-            Blur
-          </button>
-          <button
-            type="button"
-            class="seg-btn"
-            class:on={opts.redactMode === "pixelate"}
-            aria-pressed={opts.redactMode === "pixelate"}
-            onpointerdown={keepFocus}
-            onclick={() => onOptions({ redactMode: "pixelate" })}
-          >
-            Pixelate
-          </button>
+          {#each REDACT_MODES as m (m.mode)}
+            <button
+              type="button"
+              class="seg-btn"
+              class:on={opts.redactMode === m.mode}
+              aria-pressed={opts.redactMode === m.mode}
+              aria-label="{m.label} ({m.key})"
+              onpointerdown={keepFocus}
+              onclick={() => onOptions({ redactMode: m.mode })}
+            >
+              {m.label}
+            </button>
+          {/each}
         </div>
       {/if}
 
       {#if has("redactAmount")}
-        <label class="ctl">
-          <span class="sr">{opts.redactMode === "blur" ? "Blur radius" : "Block size"}</span>
-          <input
-            class="slider"
-            type="range"
-            min="2"
-            max="40"
-            step="1"
-            value={opts.redactAmount}
-            aria-label="Redaction amount"
-            {...sliderGesture}
-            oninput={(e) => onOptions({ redactAmount: e.currentTarget.valueAsNumber })}
-          />
-          <output class="ctl-value tnum">{opts.redactAmount}</output>
-        </label>
+        <!-- Fixed-width slot: see `hasAmount`. The slider leaves in erase mode,
+             the width does not. -->
+        <div class="amount">
+          {#if hasAmount}
+            <label class="ctl">
+              <span class="sr">{opts.redactMode === "blur" ? "Blur radius" : "Block size"}</span>
+              <input
+                class="slider"
+                type="range"
+                min="2"
+                max="40"
+                step="1"
+                value={opts.redactAmount}
+                aria-label="Redaction amount"
+                {...sliderGesture}
+                oninput={(e) => onOptions({ redactAmount: e.currentTarget.valueAsNumber })}
+              />
+              <output class="ctl-value tnum">{opts.redactAmount}</output>
+            </label>
+          {:else}
+            <span class="hint">From nearby pixels</span>
+          {/if}
+        </div>
       {/if}
     {/if}
   </div>
@@ -828,6 +849,31 @@
     align-items: center;
     gap: 5px;
     flex: none;
+  }
+
+  /* Holds the slider's own footprint (66 + 5 + 17 = 88) so erase mode, which has
+     no amount to set, does not take that width out of the middle of a centred
+     bar and slide every button sideways.
+     FIXED, not `min-width`: the substitute hint is ~18 characters at 11px, which
+     lands within a few pixels of 96 and can therefore come out *wider* than the
+     slider it stands in for on a system font with a wider advance. On a bar that
+     is centred with `translateX(-50%)` that is a real, if small, sideways slide
+     at exactly the moment the mode button was clicked — the same trap the
+     comment above `hasAmount` describes, only in miniature. Reserving a width
+     both children fit inside removes the variable entirely. */
+  .amount {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 116px;
+    flex: none;
+  }
+
+  /* The hint is the one child that could overflow the reserved slot; clip it
+     rather than let it push the slot wider. */
+  .amount .hint {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .ctl-value {

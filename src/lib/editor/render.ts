@@ -15,7 +15,6 @@ import type {
   Arrow,
   EditorDoc,
   Ellipse,
-  Erase,
   Highlight,
   Line,
   Pen,
@@ -184,9 +183,6 @@ function drawShape(ctx: CanvasRenderingContext2D, doc: EditorDoc, shape: Shape):
       break;
     case 'redact':
       drawRedact(ctx, doc, shape);
-      break;
-    case 'erase':
-      drawErase(ctx, doc, shape);
       break;
     case 'step':
       drawStep(ctx, shape);
@@ -363,10 +359,11 @@ function drawStep(ctx: CanvasRenderingContext2D, shape: Step): void {
 }
 
 /**
- * The only shape that reads pixels back. It samples `doc.src` and nothing
- * else, so an arrow crossing a redaction never smears into it — but it still
- * composites at its own place in painter's order, so a redaction added after
- * an arrow does cover that arrow (M2 §4.3, matches ShareX).
+ * The only shape that reads pixels back — all three redaction modes, since M5
+ * §2 folded the smart eraser in beside blur and pixelate. It samples `doc.src`
+ * and nothing else, so an arrow crossing a redaction never smears into it — but
+ * it still composites at its own place in painter's order, so a redaction added
+ * after an arrow does cover that arrow (M2 §4.3, matches ShareX).
  */
 function drawRedact(ctx: CanvasRenderingContext2D, doc: EditorDoc, shape: Redact): void {
   const area = sampleArea(doc, shape.rect);
@@ -379,11 +376,15 @@ function drawRedact(ctx: CanvasRenderingContext2D, doc: EditorDoc, shape: Redact
   const patch =
     shape.mode === 'pixelate'
       ? pixelatePatch(src, x, y, w, h, shape.amount)
-      : blurPatch(src, x, y, w, h, shape.amount, doc);
+      : shape.mode === 'erase'
+        ? // `amount` is deliberately not consulted: an erase has nothing to
+          // scale, which is why the bar hides the slider for it (M5 §2).
+          erasePatch(src, x, y, w, h, doc)
+        : blurPatch(src, x, y, w, h, shape.amount, doc);
   if (!patch) return;
 
   // Pixelate must not be resampled on the way back or the blocks turn to mush;
-  // blur is already a smooth raster and drawn 1:1 anyway.
+  // blur and the eraser are already smooth rasters and drawn 1:1 anyway.
   ctx.imageSmoothingEnabled = shape.mode !== 'pixelate';
   ctx.drawImage(patch, x, y, w, h);
 }
@@ -413,30 +414,6 @@ function readableSource(doc: EditorDoc): CanvasImageSource | null {
     if (!src.complete || src.naturalWidth === 0) return null;
   }
   return src;
-}
-
-/**
- * The smart eraser (M2.11 §3). Every pixel inside the rect is interpolated from
- * the four pixels immediately OUTSIDE it — same row left and right, same column
- * above and below — so a selection over a solid background vanishes and one
- * over a gradient follows the gradient instead of flattening it.
- *
- * Like redaction it samples `doc.src` and nothing else, and composites at its
- * own place in painter's order, so an erase drawn after an arrow covers it.
- */
-function drawErase(ctx: CanvasRenderingContext2D, doc: EditorDoc, shape: Erase): void {
-  const area = sampleArea(doc, shape.rect);
-  if (!area) return;
-  const src = readableSource(doc);
-  if (!src) return;
-
-  const patch = erasePatch(src, area.x, area.y, area.w, area.h, doc);
-  if (!patch) return;
-
-  // Drawn 1:1 into image space; only the stage's zoom resamples it, and it
-  // should resample exactly like the image underneath.
-  ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(patch, area.x, area.y, area.w, area.h);
 }
 
 /**
@@ -490,6 +467,52 @@ function erasePatch(
   return patch;
 }
 
+/**
+ * Longest edge of the grid the fill is solved on. A Laplace solution is smooth
+ * by construction, so it carries no high-frequency detail a downscale could
+ * destroy — solving small and scaling back up costs nothing real, and it is
+ * what keeps the cost of a 2000px-wide erase the same as a 200px one.
+ */
+const ERASE_GRID_MAX = 64;
+/**
+ * Relaxation sweeps. FIXED rather than run to convergence, so the cost is
+ * bounded and identical on every frame of a drag: at most
+ * ERASE_GRID_MAX² × 4 channels × this, and typically an order of magnitude
+ * less because the usual erase is a line of text, not a square.
+ */
+const ERASE_SWEEPS = 96;
+
+/** The ring of real pixels around the rect, resampled to the solve grid. */
+interface EraseRing {
+  /** One RGBA sample per grid column, from the pixel row above the rect. */
+  top: Uint8ClampedArray | null;
+  /** …and from the row below it. */
+  bottom: Uint8ClampedArray | null;
+  /** One RGBA sample per grid row, from the pixel column left of the rect. */
+  left: Uint8ClampedArray | null;
+  /** …and from the column right of it. */
+  right: Uint8ClampedArray | null;
+}
+
+/**
+ * The smart eraser (M5 §1). The rect is filled by SOLVING for the smoothest
+ * surface that meets the ring of pixels immediately outside it — Laplace's
+ * equation with the ring as a Dirichlet boundary — rather than by interpolating
+ * between four taps.
+ *
+ * Why it changed: M2.11 §3 weighted the horizontal and vertical pairs by
+ * inverse distance to their edges. On a box wider than it is tall — most of
+ * them, since you are usually erasing a line of text — the row above and below
+ * sit far closer than the columns left and right, so the vertical pair took
+ * nearly all the weight and every column became a vertical blend of whatever
+ * happened to sit above and below it. That is the vertical banding the report
+ * describes; the algorithm was doing exactly what it was told.
+ *
+ * A harmonic fill has no preferred axis, so it cannot band, and it reproduces a
+ * linear gradient exactly. It is still not content-aware fill: over a photo it
+ * produces a smooth smudge rather than invented texture, which is what "blend
+ * with nearby colours" means.
+ */
 function buildErasePatch(
   src: CanvasImageSource,
   x: number,
@@ -509,98 +532,228 @@ function buildErasePatch(
 
   const out = scratch(w, h);
   if (!out) return null;
-  const dst = out.createImageData(w, h);
-  const data = dst.data;
 
   if (!hasLeft && !hasRight && !hasTop && !hasBottom) {
     // The whole picture is selected: there is no ring to sample, so fall back
     // to the image's mean colour rather than leaving the shape unrendered.
     const mean = meanColor(src, doc);
     if (!mean) return null;
+    const flat = out.createImageData(w, h);
+    const data = flat.data;
     for (let i = 0; i < data.length; i += 4) {
       data[i] = mean[0];
       data[i + 1] = mean[1];
       data[i + 2] = mean[2];
       data[i + 3] = mean[3];
     }
-    out.putImageData(dst, 0, 0);
+    out.putImageData(flat, 0, 0);
     return out.canvas;
   }
 
-  // The rect grown by one pixel on each side that exists. That band holds every
-  // sample the interpolation reads, and pulling it in as one region keeps this
-  // to a single `getImageData` for the whole patch rather than one per pixel.
-  const sx = hasLeft ? x - 1 : x;
-  const sy = hasTop ? y - 1 : y;
-  const sw = w + (hasLeft ? 1 : 0) + (hasRight ? 1 : 0);
-  const sh = h + (hasTop ? 1 : 0) + (hasBottom ? 1 : 0);
+  // Never larger than the region itself: a small erase is solved at its true
+  // size and the scale back up below is a 1:1 blit.
+  const shrink = Math.min(1, ERASE_GRID_MAX / Math.max(w, h));
+  const gw = Math.max(1, Math.min(w, Math.round(w * shrink)));
+  const gh = Math.max(1, Math.min(h, Math.round(h * shrink)));
 
-  const ring = scratch(sw, sh);
-  if (!ring) return null;
-  ring.imageSmoothingEnabled = false;
-  ring.drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh);
-
-  let px: Uint8ClampedArray;
-  try {
-    px = ring.getImageData(0, 0, sw, sh).data;
-  } catch {
-    // Only a tainted canvas reaches here, and nothing in the app loads an image
-    // that can taint one (M2.5 §0). Drawing nothing still beats throwing out of
-    // render() and blanking the stage.
+  /*
+   * Only the RING is resampled, never the region with it. Downscaling the whole
+   * band in one go would fold the content being erased into the outermost row
+   * of the grid — on a 400x30 box each grid cell covers ~6x6 source pixels — and
+   * the boundary would then be contaminated by exactly what it is supposed to
+   * replace. Each strip is one pixel of real image, box-filtered to the grid, so
+   * a boundary value is the average of the pixels it stands for.
+   */
+  const top = hasTop ? ringStrip(src, x, y - 1, w, 1, gw, 1) : null;
+  const bottom = hasBottom ? ringStrip(src, x, y + h, w, 1, gw, 1) : null;
+  const left = hasLeft ? ringStrip(src, x - 1, y, 1, h, 1, gh) : null;
+  const right = hasRight ? ringStrip(src, x + w, y, 1, h, 1, gh) : null;
+  // A strip that was asked for and did not arrive means a tainted canvas, and
+  // nothing in the app loads an image that can taint one (M2.5 §0). Drawing
+  // nothing still beats throwing out of render() and blanking the stage.
+  if ((hasTop && !top) || (hasBottom && !bottom) || (hasLeft && !left) || (hasRight && !right)) {
     return null;
   }
 
-  // Ring-space coordinates: where patch pixel (0,0) sits, and which row/column
-  // of the band holds each sample.
-  const ox = hasLeft ? 1 : 0;
-  const oy = hasTop ? 1 : 0;
-  const leftX = 0;
-  const rightX = sw - 1;
-  const topY = 0;
-  const bottomY = sh - 1;
+  const solved = solveErase(gw, gh, { top, bottom, left, right });
 
-  // The horizontal pair and the vertical pair are interpolated separately and
-  // the two results averaged; an axis with no samples at all drops out and the
-  // other one carries the pixel alone.
-  const hShare = hasLeft || hasRight ? (hasTop || hasBottom ? 0.5 : 1) : 0;
-  const vShare = hasTop || hasBottom ? (hasLeft || hasRight ? 0.5 : 1) : 0;
+  const grid = scratch(gw, gh);
+  if (!grid) return null;
+  const img = grid.createImageData(gw, gh);
+  const px = img.data;
+  // The solved field carries a one-cell apron of boundary values; only its
+  // interior is the fill. Uint8ClampedArray rounds and clamps on assignment.
+  const stride = (gw + 2) * 4;
+  for (let j = 0; j < gh; j++) {
+    const from = (j + 1) * stride + 4;
+    const to = j * gw * 4;
+    for (let i = 0; i < gw * 4; i++) px[to + i] = solved[from + i];
+  }
+  grid.putImageData(img, 0, 0);
 
-  // Inverse distance to each edge, normalised — for two samples that is exactly
-  // a linear ramp, so a pixel one px from the left edge is dominated by the
-  // left sample. Column weights depend only on the column, so hoist them.
-  const wLeft = new Float64Array(w);
-  const wRight = new Float64Array(w);
-  for (let i = 0; i < w; i++) {
-    const dL = i + 1;
-    const dR = w - i;
-    wLeft[i] = (hasLeft ? (hasRight ? dR / (dL + dR) : 1) : 0) * hShare;
-    wRight[i] = (hasRight ? (hasLeft ? dL / (dL + dR) : 1) : 0) * hShare;
+  // Bilinearly back to the real size. See ERASE_GRID_MAX: there is no detail
+  // here to lose, and the alternative — relaxing at full resolution — is the
+  // same answer for a hundred times the work.
+  out.imageSmoothingEnabled = true;
+  out.imageSmoothingQuality = 'high';
+  out.drawImage(grid.canvas, 0, 0, gw, gh, 0, 0, w, h);
+  return out.canvas;
+}
+
+/**
+ * One strip of source pixels, resampled to `dw` x `dh`. Null only when the
+ * canvas could not be read back, which is a tainted source and nothing else.
+ */
+function ringStrip(
+  src: CanvasImageSource,
+  sx: number,
+  sy: number,
+  sw: number,
+  sh: number,
+  dw: number,
+  dh: number
+): Uint8ClampedArray | null {
+  const ctx = scratch(dw, dh);
+  if (!ctx) return null;
+  // Smoothed, so shrinking a 400px edge to 64 samples averages each run of
+  // pixels rather than point-sampling one out of it.
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(src, sx, sy, sw, sh, 0, 0, dw, dh);
+  try {
+    return ctx.getImageData(0, 0, dw, dh).data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Gauss-Seidel relaxation towards the harmonic fill, all four channels at once.
+ *
+ * The field is stored with a one-cell APRON around the interior, holding the
+ * ring values. That is what keeps the inner loop branch-free — every interior
+ * cell has four neighbours in the array, boundary or not — and it is where a
+ * missing edge is handled: `mirrorApron` copies the adjacent interior line into
+ * it before each sweep, which is a zero-flux boundary, the discrete spelling of
+ * "this side contributes nothing". A selection flush against the image edge
+ * therefore has fewer contributors rather than reading out of bounds.
+ *
+ * Returns the whole field, apron included; the caller takes the interior.
+ */
+function solveErase(gw: number, gh: number, ring: EraseRing): Float32Array {
+  const sw = gw + 2;
+  const sh = gh + 2;
+  const stride = sw * 4;
+  const f = new Float32Array(sw * sh * 4);
+  const { top, bottom, left, right } = ring;
+
+  // The apron. Its four corners are never read by a five-point stencil, so they
+  // are left at zero.
+  for (let i = 0; i < gw; i++) {
+    const t = (i + 1) * 4;
+    const b = (sh - 1) * stride + (i + 1) * 4;
+    for (let c = 0; c < 4; c++) {
+      if (top) f[t + c] = top[i * 4 + c];
+      if (bottom) f[b + c] = bottom[i * 4 + c];
+    }
+  }
+  for (let j = 0; j < gh; j++) {
+    const l = (j + 1) * stride;
+    const r = (j + 1) * stride + (sw - 1) * 4;
+    for (let c = 0; c < 4; c++) {
+      if (left) f[l + c] = left[j * 4 + c];
+      if (right) f[r + c] = right[j * 4 + c];
+    }
   }
 
-  for (let j = 0; j < h; j++) {
-    const dT = j + 1;
-    const dB = h - j;
-    const wTop = (hasTop ? (hasBottom ? dB / (dT + dB) : 1) : 0) * vShare;
-    const wBottom = (hasBottom ? (hasTop ? dT / (dT + dB) : 1) : 0) * vShare;
-    // Row samples: constant across the row. A missing edge carries weight 0, so
-    // the index it points at is never actually contributed.
-    const li = ((oy + j) * sw + leftX) * 4;
-    const ri = ((oy + j) * sw + rightX) * 4;
-
-    for (let i = 0; i < w; i++) {
-      const ti = (topY * sw + ox + i) * 4;
-      const bi = (bottomY * sw + ox + i) * 4;
-      const wl = wLeft[i];
-      const wr = wRight[i];
-      const o = (j * w + i) * 4;
+  /*
+   * Seed the interior with the axis-averaged linear ramp between opposite
+   * edges. It is not the answer, but it is already exact for a linear gradient
+   * and carries the low-frequency part of anything else — which is precisely
+   * the part relaxation is slowest to fix, and why a fixed sweep count is
+   * enough. The sweeps then remove the rest, and high-frequency error is what
+   * Gauss-Seidel kills fastest.
+   *
+   * Note the EQUAL split between the two axes. Weighting them by distance to
+   * their edges is what banded (M5 §1); an axis is dropped here only when it
+   * has no ring at all.
+   */
+  for (let j = 0; j < gh; j++) {
+    const v = (j + 0.5) / gh;
+    for (let i = 0; i < gw; i++) {
+      const u = (i + 0.5) / gw;
+      const o = (j + 1) * stride + (i + 1) * 4;
       for (let c = 0; c < 4; c++) {
-        data[o + c] = wl * px[li + c] + wr * px[ri + c] + wTop * px[ti + c] + wBottom * px[bi + c];
+        let sum = 0;
+        let n = 0;
+        if (left && right) {
+          sum += left[j * 4 + c] * (1 - u) + right[j * 4 + c] * u;
+          n++;
+        } else if (left) {
+          sum += left[j * 4 + c];
+          n++;
+        } else if (right) {
+          sum += right[j * 4 + c];
+          n++;
+        }
+        if (top && bottom) {
+          sum += top[i * 4 + c] * (1 - v) + bottom[i * 4 + c] * v;
+          n++;
+        } else if (top) {
+          sum += top[i * 4 + c];
+          n++;
+        } else if (bottom) {
+          sum += bottom[i * 4 + c];
+          n++;
+        }
+        // `n` is at least 1: the caller has already dealt with the case where
+        // no edge exists at all.
+        f[o + c] = sum / n;
       }
     }
   }
 
-  out.putImageData(dst, 0, 0);
-  return out.canvas;
+  for (let s = 0; s < ERASE_SWEEPS; s++) {
+    mirrorApron(f, gw, gh, ring);
+    for (let j = 1; j <= gh; j++) {
+      const row = j * stride;
+      for (let i = 1; i <= gw; i++) {
+        const o = row + i * 4;
+        // Each cell becomes the mean of its four neighbours — in place, so the
+        // two already visited this sweep are the updated ones.
+        f[o] = (f[o - 4] + f[o + 4] + f[o - stride] + f[o + stride]) * 0.25;
+        f[o + 1] = (f[o - 3] + f[o + 5] + f[o - stride + 1] + f[o + stride + 1]) * 0.25;
+        f[o + 2] = (f[o - 2] + f[o + 6] + f[o - stride + 2] + f[o + stride + 2]) * 0.25;
+        f[o + 3] = (f[o - 1] + f[o + 7] + f[o - stride + 3] + f[o + stride + 3]) * 0.25;
+      }
+    }
+  }
+  return f;
+}
+
+/**
+ * Refresh the apron on the sides that have no ring, by copying the interior
+ * line beside them. Cheap — O(gw + gh) — and it is the whole of the
+ * "fewer contributors" rule: a mirrored neighbour exerts no pull of its own.
+ */
+function mirrorApron(f: Float32Array, gw: number, gh: number, ring: EraseRing): void {
+  const sw = gw + 2;
+  const sh = gh + 2;
+  const stride = sw * 4;
+  if (!ring.top) f.copyWithin(4, stride + 4, stride + 4 + gw * 4);
+  if (!ring.bottom) {
+    const src = (sh - 2) * stride + 4;
+    f.copyWithin((sh - 1) * stride + 4, src, src + gw * 4);
+  }
+  if (!ring.left) {
+    for (let j = 1; j <= gh; j++) f.copyWithin(j * stride, j * stride + 4, j * stride + 8);
+  }
+  if (!ring.right) {
+    for (let j = 1; j <= gh; j++) {
+      const src = j * stride + (sw - 2) * 4;
+      f.copyWithin(j * stride + (sw - 1) * 4, src, src + 4);
+    }
+  }
 }
 
 /**

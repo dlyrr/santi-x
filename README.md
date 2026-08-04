@@ -21,9 +21,9 @@ reimplementation of the parts that matter, in Rust + Svelte.
 | **M2** | Annotation editor | ✅ done |
 | **M2.5** | Pre-warmed overlay, window auto-detect, annotate in place | ✅ done |
 | **M2.6** | Hotkeys that bind, start to tray, top toolbar, two more themes | ✅ done |
+| **M5** | OCR, scrolling capture, smart eraser | ✅ done |
 | M3 | Upload destinations (Imgur, `.sxcu`, FTP) | planned |
 | M4 | Screen recording (MP4/GIF) | planned |
-| M5 | OCR, scrolling capture, workflows | planned |
 
 ### M1 — capture
 
@@ -43,6 +43,68 @@ Arrow, rectangle, ellipse, line, pen, text, highlighter, redaction
 (blur/pixelate), auto-incrementing step counter, and non-destructive crop.
 Undo/redo, zoom 10–800%, pan, select-and-resize. Save in place, save as a new
 capture, or copy straight to the clipboard.
+
+### M5 — OCR, scrolling capture, smart eraser
+
+**Extract text** reads a capture with `Windows.Media.Ocr`, the recogniser that
+ships with the OS. Nothing leaves the machine: no service, no API key, no
+network. It is on the Lightbox, on each history card and in the editor's toolbar,
+and it shows the full text plus a per-line list, each line individually
+copyable.
+
+> If it reports that no OCR language pack is installed, add one under
+> **Settings › Time & language › Language & region** — pick a language, open its
+> ⋯ menu → *Language options*, and install the **Optical character recognition**
+> optional feature.
+
+**Redact** now has three modes rather than two: Blur (`B`), Pixelate (`P`) and
+**Smart eraser** (`X`). The eraser replaces the selection with the smoothest
+surface that meets the pixels immediately around it — a Laplace solve, not a
+blend of the four nearest edges — so it reproduces a gradient exactly instead of
+banding. It is *not* content-aware fill: over a photo it leaves a smooth smudge
+rather than invented texture.
+
+#### Scrolling capture — and where it does not work
+
+Pick a window, and santi.sharex captures it, sends it a wheel step, captures it
+again, and stitches the frames into one tall image. The join is **measured, not
+assumed** — a fixed offset would guarantee seams, because three wheel notches is
+not a number of pixels and smooth scrolling, momentum and line snapping move
+every app by a different amount. If it cannot find a confident overlap it
+**stops and keeps what it has** rather than concatenating blindly, and tells you
+it stopped early and why.
+
+It works well on ordinary scrolling content: documents, articles, long web
+pages, chat logs, code.
+
+It works **poorly, and will usually stop early, on**:
+
+- **Virtualised lists** — anything that recycles rows as you scroll (large
+  tables, some file managers, infinite feeds). The content under the viewport is
+  regenerated rather than moved, so consecutive frames have no true overlap.
+- **Parallax and animated content** — backgrounds that move at a different rate
+  than the text, or anything still animating when the frame is grabbed.
+- **Fixed headers, toolbars and sidebars** — they repeat identically in every
+  frame. The overlap search skips a margin at each edge for exactly this reason,
+  but a tall sticky header can still dominate.
+- **Anything that does not scroll with the wheel** — a pane that needs a
+  scrollbar drag reads as "the content never moved", and you get one frame.
+
+Two more things worth knowing, because they are deliberate:
+
+- **It drives the real mouse pointer.** The wheel is sent with `SendInput` with
+  the cursor parked over the window, not posted as `WM_MOUSEWHEEL` to a handle —
+  a posted message goes to the wrong child window in Chromium, Electron and WPF
+  and is silently ignored. So **moving the mouse ends the run**; that is the
+  escape hatch, and reaching for Cancel stops it on the way. The pointer is put
+  back where it was afterwards.
+- **Whatever was stitched is always kept.** Cancel, a frame budget, a resize, a
+  window coming in front — all of them finalize the frames captured so far
+  through the same pipeline as any other capture, so the result is named, saved,
+  copied and in history.
+
+Tune it under **Settings › Scrolling capture**: settle delay (raise it for apps
+with smooth scrolling), wheel notches per step, and a hard frame budget.
 
 ## How santi.sharex binds hotkeys — and what its keyboard hook does
 
@@ -125,8 +187,8 @@ the home directory, and installs `node_modules` outside the project.
 
 ## Architecture
 
-`docs/ARCHITECTURE.md` (M1), `docs/ARCHITECTURE-M2.md` (M2),
-`docs/ARCHITECTURE-M2.5.md` and `docs/ARCHITECTURE-M2.6.md` are the binding
+`docs/ARCHITECTURE.md` (M1), `docs/ARCHITECTURE-M2.md` (M2), the
+`docs/ARCHITECTURE-M2.x.md` series and `docs/ARCHITECTURE-M5.md` are the binding
 contracts — exact command names, type shapes, event names, and design tokens.
 Read them before changing anything that crosses the Rust/TypeScript seam.
 
@@ -145,16 +207,22 @@ Two things in there are load-bearing and easy to "fix" back into bugs:
 
 Untested at runtime, in rough order of likelihood:
 
-1. **A hotkey may still not fire** — if `RegisterHotKey` refuses it *and* the
+1. **Scrolling capture is the least reliable feature here** — see the list of
+   what it cannot do above. It is built to stop and say so rather than produce a
+   garbled image, so the common failure is a short capture with an explanation,
+   not a wrong one. Content that repeats vertically with a regular period is the
+   case it reads worst: a scroll of exactly one period is indistinguishable from
+   not scrolling, so it may report reaching the bottom early.
+2. **A hotkey may still not fire** — if `RegisterHotKey` refuses it *and* the
    low-level hook is switched off (or cannot install), the combo stays unbound.
    Registration failures surface as a toast; Settings › Hotkeys shows which
    mechanism owns each one.
-2. **Text nudges on commit** — the inline `<textarea>` and canvas
+3. **Text nudges on commit** — the inline `<textarea>` and canvas
    `textBaseline: 'top'` disagree by a font-dependent fraction of an em.
-3. **Large-capture performance** — the editor deep-clones shapes per repaint, and
+4. **Large-capture performance** — the editor deep-clones shapes per repaint, and
    Copy/Save pushes a base64 PNG (15–25 MB on a 4K capture) through the WebView2
    IPC in one string.
-4. **Mixed-DPI multi-monitor** — crop math is DPI-safe by construction, but
+5. **Mixed-DPI multi-monitor** — crop math is DPI-safe by construction, but
    overlay *coverage* of the virtual desktop is not guaranteed.
 
 ## Fonts — why the Claude themes look different here

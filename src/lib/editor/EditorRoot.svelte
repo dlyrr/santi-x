@@ -33,6 +33,7 @@
   import { settings } from "$lib/stores/settings.svelte";
   import Icon from "$lib/components/Icon.svelte";
   import Toast, { toast } from "$lib/components/Toast.svelte";
+  import OcrPanel from "$lib/components/OcrPanel.svelte";
   import Toolbar, { TOOLS } from "$lib/editor/Toolbar.svelte";
   import Stage from "$lib/editor/stage/Stage.svelte";
   import { doc } from "$lib/editor/doc.svelte";
@@ -69,6 +70,13 @@
   let fit = $state(true);
   /** True while the stage owns the interaction: a live drag or an open caret. */
   let stageBusy = $state(false);
+
+  /**
+   * M5 §3. `ocr_capture` reads the PNG off disk, so this needs a record with a
+   * file — the same gate the Lightbox and CaptureCard actions use.
+   */
+  let ocrOpen = $state(false);
+  const canOcr = $derived(!!record && record.saved && record.path !== "");
 
   let job = $state<Job | null>(null);
   // Not $state: it gates the close handler rather than the UI, and flipping it
@@ -275,9 +283,10 @@
    * `fill` toggle never lands a dead property on an arrow.
    */
   /**
-   * The fields of `patch` the selected shape actually owns. An erase owns none
-   * of them — its fill comes from the image (M2.11 §2) — and every other kind
-   * drops whatever the renderer would ignore.
+   * The fields of `patch` the selected shape actually owns — every kind drops
+   * whatever the renderer would ignore. A redaction takes the mode and the
+   * amount and nothing else; in erase mode the amount is inert, but the bar
+   * hides that slider (M5 §2) so it never arrives.
    */
   function shapeFields(kind: ShapeKind, patch: Partial<ToolOptions>): ShapePatch {
     switch (kind) {
@@ -288,8 +297,6 @@
         return prune({ color: patch.color, size: patch.textSize });
       case "redact":
         return prune({ mode: patch.redactMode, amount: patch.redactAmount });
-      case "erase":
-        return {};
       default:
         return prune({ color: patch.color, stroke: patch.stroke });
     }
@@ -307,8 +314,8 @@
     /*
      * Nothing survived the filter, so this control does not describe the
      * selected shape. The options bar itself already hides such a control, but
-     * a tool shortcut carries a preset with it — pressing `B` with an erase
-     * selected lands here with a `redactMode` the erase has no use for.
+     * a tool shortcut carries a preset with it — pressing `B` with an arrow
+     * selected lands here with a `redactMode` the arrow has no use for.
      *
      * Bailing BEFORE `beginDrag` and `updateShape` is the point: both push an
      * undo entry, and an entry that restores identical pixels is worse than no
@@ -401,6 +408,22 @@
     // Escape and typing itself, and a bare `A` there must stay an `A`.
     if (isTyping(event.target) || stageBusy) return;
 
+    /*
+     * The OCR panel is modal and answers its own keys, but it can only stop what
+     * bubbles through it — a click on its scrim leaves focus on `<body>`, and
+     * from there Escape would run the ladder below and CLOSE THE WHOLE EDITOR
+     * from behind an open dialog. So the panel owns Escape whenever it is up,
+     * and swallows every other key rather than letting `R` switch the tool
+     * underneath it.
+     */
+    if (ocrOpen) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        ocrOpen = false;
+      }
+      return;
+    }
+
     // Escape stays live in every phase — it is the only way out of the error
     // state without reaching for the mouse.
     if (event.key === "Escape") {
@@ -463,8 +486,8 @@
     }
 
     // Single-key tool switch. Checked last so Ctrl+S never lands on Save-as-new.
-    // `B`/`P` both land on Redact and bring the mode with them, matching
-    // ShareX's separate Blur and Pixelate tools.
+    // `B`, `P` and `X` all land on Redact and bring the mode with them: ShareX's
+    // separate Blur and Pixelate tools, plus the smart eraser M5 §2 folded in.
     const hit = toolHitForKey(key);
     if (hit) {
       event.preventDefault();
@@ -491,6 +514,9 @@
     onRedo={() => doc.redo()}
     onDelete={deleteSelected}
     onResetCrop={() => doc.setCrop(null)}
+    {canOcr}
+    ocrStale={doc.dirty}
+    onOcr={() => (ocrOpen = true)}
   />
 
   <main class="stage-area">
@@ -611,6 +637,12 @@
     </div>
   </footer>
 </div>
+
+<!-- Outside `.editor` on purpose: the panel portals itself to `<body>` and is
+     the modal on top, above the stage and the toolbar's tooltips. -->
+{#if ocrOpen && record && canOcr}
+  <OcrPanel {record} onclose={() => (ocrOpen = false)} />
+{/if}
 
 <Toast />
 

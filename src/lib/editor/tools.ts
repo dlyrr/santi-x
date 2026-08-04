@@ -11,7 +11,7 @@ import type {
   EditorDoc,
   Point,
   Rect,
-  Redact,
+  RedactMode,
   Shape,
   ShapeKind,
   ShapePatch
@@ -27,14 +27,13 @@ export type ToolId =
   | 'text'
   | 'highlight'
   | 'redact'
-  | 'erase'
   | 'step'
   | 'crop';
 
 /** Which controls the shared options bar shows for the active tool. */
 export type ToolOption = 'color' | 'stroke' | 'fill' | 'textSize' | 'redactMode' | 'redactAmount';
 
-export type RedactMode = Redact['mode'];
+export type { RedactMode };
 
 /**
  * The live value of every control in the shared options bar (M2 §4.4). One flat
@@ -63,17 +62,17 @@ export interface ToolDef {
   /** Single-key shortcut, lower case. Matches ShareX's region-capture keymap. */
   key: string;
   /**
-   * A second key that also selects this tool, applying `altPreset`.
+   * Further keys that also select this tool, each carrying its own preset.
    *
-   * ShareX splits into two tools what santi.sharex models as one with a mode:
-   * `B` is Blur and `P` is Pixelate. Rather than fork Redact in two, both keys
-   * select it and set the mode, so the ShareX muscle memory lands correctly.
+   * ShareX splits into separate tools what santi.sharex models as one with a
+   * mode: `B` is Blur and `P` is Pixelate. Rather than fork Redact, every key
+   * selects it and sets the mode, so the ShareX muscle memory lands correctly.
+   * M5 §2 folded the smart eraser in the same way — `X` is now Redact in erase
+   * mode rather than a tool of its own.
    */
-  altKey?: string;
+  altKeys?: readonly { key: string; preset?: ToolPreset }[];
   /** Applied when `key` selects this tool. */
   preset?: ToolPreset;
-  /** Applied when `altKey` selects this tool. */
-  altPreset?: ToolPreset;
   /** CSS cursor for the stage while this tool is active. */
   cursor: string;
   options: readonly ToolOption[];
@@ -158,28 +157,19 @@ export const TOOLS: readonly ToolDef[] = [
     id: 'redact',
     label: 'Redact',
     key: 'b',
-    altKey: 'p',
     preset: { redactMode: 'blur' },
-    altPreset: { redactMode: 'pixelate' },
+    altKeys: [
+      { key: 'p', preset: { redactMode: 'pixelate' } },
+      // `X` is OURS, not ShareX's: ShareX leaves the smart eraser unbound — its
+      // issue tracker carries open requests for a key — and `X` is its Cut Out
+      // key, which santi.sharex does not implement. So it is free, and it sits
+      // beside the other content-removal keys. Do not "correct" it to match
+      // ShareX. Same key it had as a standalone tool, one fewer tool (M5 §2).
+      { key: 'x', preset: { redactMode: 'erase' } }
+    ],
     cursor: 'crosshair',
     options: ['redactMode', 'redactAmount'],
     creates: 'redact',
-    shift: 'Square'
-  },
-  {
-    id: 'erase',
-    label: 'Smart eraser',
-    // `X` is OURS, not ShareX's: ShareX leaves this tool unbound — its issue
-    // tracker carries open requests for a key — and `X` is its Cut Out key,
-    // which santi.sharex does not implement. So it is free, and it sits beside
-    // the other content-removal tools. Do not "correct" it to match ShareX.
-    key: 'x',
-    cursor: 'crosshair',
-    // Deliberately empty: the fill comes from the image, so neither colour nor
-    // stroke does anything. The options bar keys off this array, so anything
-    // listed here would be a dead control.
-    options: [],
-    creates: 'erase',
     shift: 'Square'
   },
   {
@@ -201,11 +191,11 @@ export const TOOLS: readonly ToolDef[] = [
 ];
 
 const BY_ID = new Map<ToolId, ToolDef>(TOOLS.map((t) => [t.id, t]));
-/** Both `key` and `altKey` resolve here, each carrying its own preset. */
+/** `key` and every `altKeys` entry resolve here, each carrying its own preset. */
 const BY_KEY = new Map<string, { tool: ToolDef; preset?: ToolPreset }>();
 for (const t of TOOLS) {
   BY_KEY.set(t.key, { tool: t, preset: t.preset });
-  if (t.altKey) BY_KEY.set(t.altKey, { tool: t, preset: t.altPreset });
+  for (const alt of t.altKeys ?? []) BY_KEY.set(alt.key, { tool: t, preset: alt.preset });
 }
 
 export function toolById(id: ToolId): ToolDef {
@@ -220,8 +210,8 @@ export function toolForKey(key: string): ToolDef | null {
 
 /**
  * The same lookup, plus any option overrides the key implies — `B` selects
- * Redact in blur mode, `P` selects it in pixelate mode, matching ShareX's two
- * separate tools. Callers that can apply options should prefer this.
+ * Redact in blur mode, `P` in pixelate and `X` in erase (M5 §2). Callers that
+ * can apply options should prefer this.
  */
 export function toolHitForKey(key: string): { tool: ToolDef; preset?: ToolPreset } | null {
   return BY_KEY.get(key.toLowerCase()) ?? null;
@@ -252,11 +242,10 @@ export function optionsForKind(kind: ShapeKind): readonly ToolOption[] {
       return ['color', 'textSize'];
     case 'highlight':
       return ['color'];
+    // The amount is meaningless in erase mode — the bar drops that one control
+    // itself, since it turns on the live mode rather than on the kind (M5 §2).
     case 'redact':
       return ['redactMode', 'redactAmount'];
-    // The eraser fills from the image: it has nothing to configure (M2.11 §2).
-    case 'erase':
-      return [];
     case 'rect':
     case 'ellipse':
       return ['color', 'stroke', 'fill'];
@@ -310,7 +299,6 @@ function hits(shape: Shape, p: Point, tol: number): boolean {
       return hitsEllipse(p, normalizeRect(shape.rect), shape.fill, half + tol);
     case 'highlight':
     case 'redact':
-    case 'erase':
       return insideRect(p, normalizeRect(shape.rect), tol);
     case 'text':
       return insideRect(p, textBounds(shape), tol);
@@ -381,8 +369,7 @@ export function handlesFor(shape: Shape): Handle[] {
     shape.kind === 'rect' ||
     shape.kind === 'ellipse' ||
     shape.kind === 'highlight' ||
-    shape.kind === 'redact' ||
-    shape.kind === 'erase'
+    shape.kind === 'redact'
   ) {
     const r = normalizeRect(shape.rect);
     return RECT_HANDLES.map((h) => ({
@@ -413,8 +400,7 @@ export function resizePatch(shape: Shape, handle: HandleId, point: Point): Shape
     shape.kind !== 'rect' &&
     shape.kind !== 'ellipse' &&
     shape.kind !== 'highlight' &&
-    shape.kind !== 'redact' &&
-    shape.kind !== 'erase'
+    shape.kind !== 'redact'
   ) {
     return {};
   }
@@ -445,7 +431,6 @@ export function movePatch(shape: Shape, dx: number, dy: number): ShapePatch {
     case 'ellipse':
     case 'highlight':
     case 'redact':
-    case 'erase':
       return { rect: { ...shape.rect, x: shape.rect.x + dx, y: shape.rect.y + dy } };
     case 'pen':
       return { points: shape.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) };
@@ -470,7 +455,6 @@ export function shapeBounds(shape: Shape): Rect {
     // Flat fills with no stroke to pad by: the bounds are exactly the rect.
     case 'highlight':
     case 'redact':
-    case 'erase':
       return normalizeRect(shape.rect);
     case 'text':
       return textBounds(shape);

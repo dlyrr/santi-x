@@ -26,19 +26,27 @@ export type Pen = ShapeBase & { kind: 'pen'; points: Point[] };
 export type Highlight = ShapeBase & { kind: 'highlight'; rect: Rect };
 /** `at` is the TOP-LEFT of the text block; lines grow downwards. */
 export type TextShape = ShapeBase & { kind: 'text'; at: Point; text: string; size: number };
-/** `amount` is a blur radius in image px, or a pixelate cell size in image px. */
+/**
+ * "Make this unreadable", in three flavours (M5 §2): `blur` and `pixelate`
+ * cover the content, `erase` — the smart eraser — replaces it with the
+ * smoothest fill that meets the pixels just outside `rect`.
+ *
+ * `amount` is a blur radius in image px, or a pixelate cell size in image px,
+ * and is MEANINGLESS for `erase`: that fill comes entirely from the image, so
+ * there is nothing to scale and the toolbar hides the control. It is still
+ * carried, so switching a shape between modes keeps the amount it had.
+ *
+ * `color` and `stroke` ride along because every shape has them; the renderer
+ * uses neither, so the toolbar offers neither.
+ */
+export type RedactMode = 'blur' | 'pixelate' | 'erase';
+
 export type Redact = ShapeBase & {
   kind: 'redact';
   rect: Rect;
-  mode: 'blur' | 'pixelate';
+  mode: RedactMode;
   amount: number;
 };
-/**
- * The smart eraser (M2.11 §2). Carries `color` and `stroke` because every shape
- * does, but **neither is used** — the fill is interpolated from the pixels just
- * outside `rect`, so the toolbar shows no colour or stroke control for it.
- */
-export type Erase = ShapeBase & { kind: 'erase'; rect: Rect };
 /** `at` is the CENTRE of the badge. */
 export type Step = ShapeBase & { kind: 'step'; at: Point; n: number };
 
@@ -51,7 +59,6 @@ export type Shape =
   | Highlight
   | TextShape
   | Redact
-  | Erase
   | Step;
 
 export type ShapeKind = Shape['kind'];
@@ -89,7 +96,6 @@ type ShapeFields = Omit<Arrow, 'id' | 'kind'> &
   Omit<Highlight, 'id' | 'kind'> &
   Omit<TextShape, 'id' | 'kind'> &
   Omit<Redact, 'id' | 'kind'> &
-  Omit<Erase, 'id' | 'kind'> &
   Omit<Step, 'id' | 'kind'>;
 
 export type ShapePatch = Partial<ShapeFields>;
