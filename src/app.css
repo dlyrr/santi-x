@@ -745,9 +745,51 @@ textarea.input {
 }
 
 /* A deliberate replica of ShareX's own chrome, for the muscle memory: Segoe UI,
-   near-square corners, tight density, cool greys, Windows blue. This is the one
+   square corners, tight density, cool greys, Windows blue. This is the one
    theme that overrides --radius/--radius-lg — ShareX is not a rounded app — so
-   those two tokens live in every block rather than a shared one. */
+   those two tokens live in every block rather than a shared one.
+
+   --radius/--radius-lg are 0, not 3px/4px. ShareX is WinForms: nothing in it is
+   rounded, and 3px is the kind of not-quite that reads as "a modern app wearing
+   grey" rather than as the real thing. Zeroing the tokens squares every
+   `var(--radius)` consumer in the app at once — every shared control, every
+   view's own rule — instead of ShareXShell having to reach into other
+   components by class name to flatten them one at a time. The handful of hard
+   literal radii left in the views are flattened by ShareXShell's own
+   `.pane :global(…)` list; the theme picker's preview mocks are the deliberate
+   exception, because they scale from `--m-radius` to depict the theme they are
+   advertising rather than the one being worn.
+
+   The three grey steps are ordered the way a WinForms form is: --bg-inset is
+   the darkest and carries the left menu column, --bg is the form face, and
+   --bg-raised/--surface are the lift used for header rows and hover. The menu
+   being *darker* than the content, rather than lighter, is what stops it
+   reading as a panel dropped on top — see ShareXShell.
+
+   --border and --border-strong are a step brighter than the rest of the family
+   on purpose: ShareX's hotkey grid draws a visible 1px line on every cell, and
+   at #3f3f3f those lines disappeared into the form.
+
+   The text ramp is #dcdcdc / #b3b3b3 / #929292, and the two dimmer steps are
+   set where they are so that the dimmest one clears 4.5:1 on *every* surface
+   this theme paints, not just the dark ones:
+
+     --text-faint (#929292) against
+       --bg-inset  #171717  5.76:1
+       --bg        #1c1c1c  5.48:1
+       .pane gradient top color-mix(--text 5%, --bg) ≈ #262626   4.86:1
+       --bg-raised/--surface #2b2b2b (card fills, table header, hover)  4.55:1
+
+   An earlier pass had --text-faint at #858585, which failed the last two
+   (4.10:1 and 3.84:1) — and those are exactly where 12px help text lands: the
+   tool and task descriptions sit in the gradient band, and the shared views'
+   faint text sits on --surface. --text-dim was lifted from #9a9a9a to #b3b3b3
+   at the same time, because #9a9a9a is only eight steps off #929292 and the
+   dim/faint distinction this theme leans on would have collapsed. Lighter
+   secondary text is also the more faithful direction: ShareX's own dark theme
+   is not a murky one.
+
+   Do not darken either step back without re-measuring all four surfaces. */
 :root[data-theme="sharex"] {
   color-scheme: dark;
 
@@ -755,12 +797,12 @@ textarea.input {
   --bg-raised: #2b2b2b;
   --bg-inset: #171717;
   --surface: #2b2b2b;
-  --border: #3f3f3f;
-  --border-strong: #565656;
+  --border: #454545;
+  --border-strong: #5e5e5e;
 
   --text: #dcdcdc;
-  --text-dim: #9a9a9a;
-  --text-faint: #6f6f6f;
+  --text-dim: #b3b3b3;
+  --text-faint: #929292;
 
   --accent: #0078d7;
   --accent-hover: #1f8ae0;
@@ -768,8 +810,8 @@ textarea.input {
   --danger: #d13438;
   --success: #4ec36a;
 
-  --radius: 3px;
-  --radius-lg: 4px;
+  --radius: 0;
+  --radius-lg: 0;
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.55), 0 4px 10px -6px rgba(0, 0, 0, 0.5);
   --blur: none;
 

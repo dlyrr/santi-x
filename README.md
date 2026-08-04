@@ -22,8 +22,16 @@ reimplementation of the parts that matter, in Rust + Svelte.
 | **M2.5** | Pre-warmed overlay, window auto-detect, annotate in place | ✅ done |
 | **M2.6** | Hotkeys that bind, start to tray, top toolbar, two more themes | ✅ done |
 | **M5** | OCR, scrolling capture, smart eraser | ✅ done |
+| **M2.7** | ShareX's own layout for the `sharex` theme | ✅ done |
 | M3 | Upload destinations (Imgur, `.sxcu`, FTP) | planned |
 | M4 | Screen recording (MP4/GIF) | planned |
+| M6 | Workflows — chaining capture → action → destination | planned |
+
+M5 was scoped as "OCR, scrolling capture, workflows" and shipped the first two
+plus the smart eraser; workflows did not make it. They are M6 now rather than
+being quietly folded into a milestone that is already marked done — the
+`sharex` shell's disabled **Workflows** row names that milestone, and a
+disabled row pointing at a shipped milestone is a lie the UI would be telling.
 
 ### M1 — capture
 
