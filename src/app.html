@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%sveltekit.assets%/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>santi.sharex</title>
+    <script>
+      // Runs before first paint. Applying the theme on mount flashes the wrong
+      // palette for a frame. Rust `Settings.theme` is the durable source of
+      // truth; localStorage is only the pre-paint cache.
+      (function () {
+        // Keep in sync with THEMES in src/lib/types.ts and the blocks at the
+        // bottom of src/app.css. Anything else — an older cache, a hand-edited
+        // settings file — falls back to dark rather than leaving the page with
+        // no palette at all.
+        var THEMES = ["dark", "claude", "claude-dark", "sharex"];
+        // Keep in sync with THEME_STORAGE_KEY / LEGACY_THEME_STORAGE_KEY in
+        // src/lib/types.ts. The legacy key is the pre-rename cache written when
+        // this app was called Nimbus: on the first launch after the rename the
+        // new key does not exist yet, and reading only it would paint the
+        // default palette for one frame before Rust corrected it — the exact
+        // flash this script exists to prevent. Read new, fall back to legacy,
+        // then write the value forward so the fallback is needed only once.
+        var KEY = "santi-sharex.theme";
+        var LEGACY_KEY = "nimbus.theme";
+        try {
+          var t = localStorage.getItem(KEY);
+          var migrating = t === null;
+          if (migrating) t = localStorage.getItem(LEGACY_KEY);
+          var theme = THEMES.indexOf(t) === -1 ? "dark" : t;
+          document.documentElement.dataset.theme = theme;
+          if (migrating && t !== null) {
+            // Nested: a quota/private-mode failure here must not undo the theme
+            // already stamped above, it only costs us the migrated cache.
+            try {
+              localStorage.setItem(KEY, theme);
+            } catch (e) {
+              /* the settings store rewrites it once Rust reports in */
+            }
+          }
+        } catch (e) {
+          document.documentElement.dataset.theme = "dark";
+        }
+        // Both windows load this same document (see ARCHITECTURE §1), so the
+        // overlay is flagged here, before first paint: its document must be
+        // transparent and unscrollable, and doing that on mount would show one
+        // frame of the opaque app background over the user's desktop.
+        try {
+          if (
+            new URLSearchParams(window.location.search).get("w") === "overlay"
+          ) {
+            document.documentElement.classList.add("overlay-window");
+          }
+        } catch (e) {
+          /* main window is the safe default */
+        }
+      })();
+    </script>
+    %sveltekit.head%
+  </head>
+  <body class="santi-sharex" data-sveltekit-preload-data="hover">
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

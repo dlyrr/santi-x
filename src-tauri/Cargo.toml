@@ -1,0 +1,55 @@
+[package]
+name = "santi-sharex"
+version = "0.1.0"
+description = "Screen capture for Windows, rebuilt"
+authors = ["santi"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "santi_sharex_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xcap = "0.9.7"
+image = "0.25.10"
+chrono = { version = "0.4.45", features = ["serde"] }
+tauri-plugin-global-shortcut = "2.3.2"
+tauri-plugin-clipboard-manager = "2.3.2"
+base64 = "0.22"
+# M2.6 §1: the WH_KEYBOARD_LL fallback in `hotkeys.rs`. 0.61 is what the Tauri
+# dependency tree already resolves to, so this adds no second copy of the
+# Windows metadata crates. santi.sharex is a Windows-only app, so this is an
+# unconditional dependency rather than a `cfg(windows)` one.
+#
+# The DataExchange/Memory/Gdi features are M2.7 §1: the native clipboard
+# fallback in `clipboard.rs`. Gdi is there only for `BITMAPV5HEADER`;
+# `Win32_System_Ole` is deliberately *not* enabled — it exists here only to
+# define `CF_DIBV5` as a `u16`, and pulls the whole COM surface in to do it.
+#
+# Registry is the rename migration in `migrate.rs`: the stale `Run` value the
+# old "Nimbus" autostart registration left behind is read and deleted through
+# the API rather than by shelling out to `reg.exe`.
+windows = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
+tauri-plugin-autostart = "2.5.1"

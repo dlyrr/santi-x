@@ -1,0 +1,6 @@
+# Keeps the pnpm store inside this project. Without this file pnpm walks up and
+# finds C:\Users\santi\pnpm-workspace.yaml, which puts node_modules in the home dir.
+packages: []
+
+allowBuilds:
+  esbuild: true

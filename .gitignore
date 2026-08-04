@@ -1,0 +1,33 @@
+.DS_Store
+node_modules
+/build
+/.svelte-kit
+/package
+.env
+.env.*
+!.env.example
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Rust build output
+src-tauri/target/
+
+# Tauri generated schemas — rewritten by the build script on every build
+src-tauri/gen/schemas/
+
+# Anthropic Sans is NOT redistributable.
+#
+# The Claude themes are set in Anthropic Sans, but it is Anthropic's proprietary
+# brand typeface, and committing it to a public repository would be
+# redistributing it. The @font-face rules fall back to the system stack when the
+# files are absent, so the app builds and runs fine without them — the Claude
+# themes simply render in the fallback face. See the README to add them locally.
+static/fonts/*.otf
+static/fonts/*.ttf
+static/fonts/*.woff
+static/fonts/*.woff2
+
+# Editor / OS
+.idea/
+Thumbs.db
+*.swp
