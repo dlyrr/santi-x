@@ -67,7 +67,15 @@
   import { settings } from "$lib/stores/settings.svelte";
   import OverlayToolbar, { OVERLAY_TOOLS, REGION_TOOL } from "$lib/overlay/OverlayToolbar.svelte";
   import { createEditorDoc } from "$lib/editor/doc.svelte";
-  import type { EditorDoc, Point, Shape, ShapeInit, TextShape } from "$lib/editor/doc.svelte";
+  import type {
+    EditorDoc,
+    Point,
+    Shape,
+    ShapeInit,
+    ShapeKind,
+    ShapePatch,
+    TextShape
+  } from "$lib/editor/doc.svelte";
   import { ANNOTATION_FONT_FAMILY, TEXT_LINE_HEIGHT, render } from "$lib/editor/render";
   import { renderToPng } from "$lib/editor/export";
   import {
@@ -1123,6 +1131,11 @@
           mode: opts.redactMode,
           amount: opts.redactAmount
         };
+      // Colour and stroke are carried because `ShapeBase` requires them, but
+      // the renderer ignores both: an erase fills from the surrounding pixels
+      // (M2.11 §2). Passing the live opts keeps the shape uniform with the rest.
+      case "erase":
+        return { kind: "erase", color: opts.color, stroke: opts.stroke, rect };
       case "step":
         return { kind: "step", color: opts.color, stroke: opts.stroke, at, n: doc.nextStepNumber };
       default:
@@ -1156,6 +1169,7 @@
       case "ellipse":
       case "highlight":
       case "redact":
+      case "erase":
         doc.updateShape(d.id, { rect: rectFromPoints(d.start, p, shift) });
         break;
       case "pen":
@@ -1176,6 +1190,7 @@
       case "ellipse":
       case "highlight":
       case "redact":
+      case "erase":
         return Math.max(Math.abs(shape.rect.width), Math.abs(shape.rect.height));
       default:
         // Pen and step are placed, not spanned: a tap is a legitimate result.
@@ -1522,27 +1537,47 @@
     doc.endDrag();
   }
 
+  /**
+   * The fields of `patch` the selected shape actually owns. An erase owns none
+   * of them — its fill comes from the image (M2.11 §2) — and every other kind
+   * drops whatever the renderer would ignore.
+   */
+  function shapeFields(kind: ShapeKind, patch: Partial<ToolOptions>): ShapePatch {
+    switch (kind) {
+      case "rect":
+      case "ellipse":
+        return prune({ color: patch.color, stroke: patch.stroke, fill: patch.fill });
+      case "text":
+        return prune({ color: patch.color, size: patch.textSize });
+      case "redact":
+        return prune({ mode: patch.redactMode, amount: patch.redactAmount });
+      case "erase":
+        return {};
+      default:
+        return prune({ color: patch.color, stroke: patch.stroke });
+    }
+  }
+
   function applyOptions(patch: Partial<ToolOptions>): void {
     opts = { ...opts, ...patch };
     const id = doc.selected;
     if (id === null) return;
     const shape = doc.shapes.find((s) => s.id === id);
     if (!shape) return;
+    const next = shapeFields(shape.kind, patch);
+    /*
+     * Nothing survived the filter, so this control does not describe the
+     * selected shape at all — the Region tool keeps colour and stroke on the bar
+     * whatever is selected, and an erase answers to neither.
+     *
+     * Bailing BEFORE `beginDrag` and `updateShape` is the point: both push an
+     * undo entry, and an entry that restores identical pixels is worse than no
+     * entry — Ctrl+Z after picking a colour would appear to do nothing instead
+     * of removing the erase, and the capture would count as edited.
+     */
+    if (Object.keys(next).length === 0) return;
     if (optionDrag && !doc.dragging) doc.beginDrag("restyle");
-    switch (shape.kind) {
-      case "rect":
-      case "ellipse":
-        doc.updateShape(id, prune({ color: patch.color, stroke: patch.stroke, fill: patch.fill }));
-        break;
-      case "text":
-        doc.updateShape(id, prune({ color: patch.color, size: patch.textSize }));
-        break;
-      case "redact":
-        doc.updateShape(id, prune({ mode: patch.redactMode, amount: patch.redactAmount }));
-        break;
-      default:
-        doc.updateShape(id, prune({ color: patch.color, stroke: patch.stroke }));
-    }
+    doc.updateShape(id, next);
   }
 
   /**

@@ -20,6 +20,7 @@
     text: "text",
     highlight: "highlighter",
     redact: "droplet",
+    erase: "eraser",
     step: "step",
     crop: "crop"
   };

@@ -33,6 +33,12 @@ export type Redact = ShapeBase & {
   mode: 'blur' | 'pixelate';
   amount: number;
 };
+/**
+ * The smart eraser (M2.11 §2). Carries `color` and `stroke` because every shape
+ * does, but **neither is used** — the fill is interpolated from the pixels just
+ * outside `rect`, so the toolbar shows no colour or stroke control for it.
+ */
+export type Erase = ShapeBase & { kind: 'erase'; rect: Rect };
 /** `at` is the CENTRE of the badge. */
 export type Step = ShapeBase & { kind: 'step'; at: Point; n: number };
 
@@ -45,6 +51,7 @@ export type Shape =
   | Highlight
   | TextShape
   | Redact
+  | Erase
   | Step;
 
 export type ShapeKind = Shape['kind'];
@@ -82,6 +89,7 @@ type ShapeFields = Omit<Arrow, 'id' | 'kind'> &
   Omit<Highlight, 'id' | 'kind'> &
   Omit<TextShape, 'id' | 'kind'> &
   Omit<Redact, 'id' | 'kind'> &
+  Omit<Erase, 'id' | 'kind'> &
   Omit<Step, 'id' | 'kind'>;
 
 export type ShapePatch = Partial<ShapeFields>;

@@ -15,6 +15,7 @@ import type {
   Arrow,
   EditorDoc,
   Ellipse,
+  Erase,
   Highlight,
   Line,
   Pen,
@@ -183,6 +184,9 @@ function drawShape(ctx: CanvasRenderingContext2D, doc: EditorDoc, shape: Shape):
       break;
     case 'redact':
       drawRedact(ctx, doc, shape);
+      break;
+    case 'erase':
+      drawErase(ctx, doc, shape);
       break;
     case 'step':
       drawStep(ctx, shape);
@@ -365,30 +369,275 @@ function drawStep(ctx: CanvasRenderingContext2D, shape: Step): void {
  * an arrow does cover that arrow (M2 §4.3, matches ShareX).
  */
 function drawRedact(ctx: CanvasRenderingContext2D, doc: EditorDoc, shape: Redact): void {
-  const n = normalizeRect(shape.rect);
-  const x0 = clamp(Math.round(n.x), 0, doc.width);
-  const y0 = clamp(Math.round(n.y), 0, doc.height);
-  const x1 = clamp(Math.round(n.x + n.width), x0, doc.width);
-  const y1 = clamp(Math.round(n.y + n.height), y0, doc.height);
-  const w = x1 - x0;
-  const h = y1 - y0;
-  if (w < 1 || h < 1) return;
+  const area = sampleArea(doc, shape.rect);
+  if (!area) return;
+  const { x, y, w, h } = area;
 
-  const src = doc.src;
-  if (typeof HTMLImageElement !== 'undefined' && src instanceof HTMLImageElement) {
-    if (!src.complete || src.naturalWidth === 0) return;
-  }
+  const src = readableSource(doc);
+  if (!src) return;
 
   const patch =
     shape.mode === 'pixelate'
-      ? pixelatePatch(src, x0, y0, w, h, shape.amount)
-      : blurPatch(src, x0, y0, w, h, shape.amount, doc);
+      ? pixelatePatch(src, x, y, w, h, shape.amount)
+      : blurPatch(src, x, y, w, h, shape.amount, doc);
   if (!patch) return;
 
   // Pixelate must not be resampled on the way back or the blocks turn to mush;
   // blur is already a smooth raster and drawn 1:1 anyway.
   ctx.imageSmoothingEnabled = shape.mode !== 'pixelate';
-  ctx.drawImage(patch, x0, y0, w, h);
+  ctx.drawImage(patch, x, y, w, h);
+}
+
+/**
+ * The part of a shape's rect that actually lies on the image, snapped to whole
+ * pixels. Every shape that reads pixels back goes through here, so redaction
+ * and the eraser cover exactly the same pixels for the same rect.
+ */
+function sampleArea(
+  doc: EditorDoc,
+  rect: Rect
+): { x: number; y: number; w: number; h: number } | null {
+  const n = normalizeRect(rect);
+  const x0 = clamp(Math.round(n.x), 0, doc.width);
+  const y0 = clamp(Math.round(n.y), 0, doc.height);
+  const x1 = clamp(Math.round(n.x + n.width), x0, doc.width);
+  const y1 = clamp(Math.round(n.y + n.height), y0, doc.height);
+  if (x1 - x0 < 1 || y1 - y0 < 1) return null;
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+/** `doc.src`, or null while it is the blank stand-in or has not decoded yet. */
+function readableSource(doc: EditorDoc): CanvasImageSource | null {
+  const src = doc.src;
+  if (typeof HTMLImageElement !== 'undefined' && src instanceof HTMLImageElement) {
+    if (!src.complete || src.naturalWidth === 0) return null;
+  }
+  return src;
+}
+
+/**
+ * The smart eraser (M2.11 §3). Every pixel inside the rect is interpolated from
+ * the four pixels immediately OUTSIDE it — same row left and right, same column
+ * above and below — so a selection over a solid background vanishes and one
+ * over a gradient follows the gradient instead of flattening it.
+ *
+ * Like redaction it samples `doc.src` and nothing else, and composites at its
+ * own place in painter's order, so an erase drawn after an arrow covers it.
+ */
+function drawErase(ctx: CanvasRenderingContext2D, doc: EditorDoc, shape: Erase): void {
+  const area = sampleArea(doc, shape.rect);
+  if (!area) return;
+  const src = readableSource(doc);
+  if (!src) return;
+
+  const patch = erasePatch(src, area.x, area.y, area.w, area.h, doc);
+  if (!patch) return;
+
+  // Drawn 1:1 into image space; only the stage's zoom resamples it, and it
+  // should resample exactly like the image underneath.
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(patch, area.x, area.y, area.w, area.h);
+}
+
+/**
+ * Patches are memoised because the fill is per-pixel work and `render()` runs on
+ * every repaint — panning, zooming, or drawing another shape beside an existing
+ * erase must not recompute it. The fill depends only on the source pixels and
+ * the rect, so geometry is the whole key.
+ *
+ * Held weakly per source image: `doc.src` is a fresh `ImageBitmap` per load
+ * (M2.5 §0), so a new document can never read the previous one's patches, and
+ * loading a second capture drops the first one's cache with the bitmap itself.
+ */
+const ERASE_CACHE_LIMIT = 6;
+const erasePatchCache = new WeakMap<CanvasImageSource, Map<string, HTMLCanvasElement>>();
+
+function erasePatch(
+  src: CanvasImageSource,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  doc: EditorDoc
+): HTMLCanvasElement | null {
+  let cache = erasePatchCache.get(src);
+  if (!cache) {
+    cache = new Map();
+    erasePatchCache.set(src, cache);
+  }
+  const key = `${x},${y},${w},${h}`;
+  const hit = cache.get(key);
+  if (hit) {
+    // Re-insert so eviction is least-recently-USED, not least-recently-built.
+    // Without this a drag is pathological: every frame of it mints a fresh
+    // geometry, and once those inserts have pushed the settled erases out by
+    // age the renderer rebuilds EVERY erase in the document on EVERY frame
+    // rather than just the one under the pointer.
+    cache.delete(key);
+    cache.set(key, hit);
+    return hit;
+  }
+
+  const patch = buildErasePatch(src, x, y, w, h, doc);
+  if (!patch) return null;
+  // A Map iterates in insertion order, so the first key is now the least
+  // recently used one.
+  if (cache.size >= ERASE_CACHE_LIMIT) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, patch);
+  return patch;
+}
+
+function buildErasePatch(
+  src: CanvasImageSource,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  doc: EditorDoc
+): HTMLCanvasElement | null {
+  // Which edges have a pixel outside them at all. A selection flush against the
+  // image edge simply has fewer contributors — it must never read out of bounds
+  // and pick up transparent black, which would paint a hard dark rectangle
+  // exactly where the user wanted something invisible.
+  const hasLeft = x > 0;
+  const hasRight = x + w < doc.width;
+  const hasTop = y > 0;
+  const hasBottom = y + h < doc.height;
+
+  const out = scratch(w, h);
+  if (!out) return null;
+  const dst = out.createImageData(w, h);
+  const data = dst.data;
+
+  if (!hasLeft && !hasRight && !hasTop && !hasBottom) {
+    // The whole picture is selected: there is no ring to sample, so fall back
+    // to the image's mean colour rather than leaving the shape unrendered.
+    const mean = meanColor(src, doc);
+    if (!mean) return null;
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = mean[0];
+      data[i + 1] = mean[1];
+      data[i + 2] = mean[2];
+      data[i + 3] = mean[3];
+    }
+    out.putImageData(dst, 0, 0);
+    return out.canvas;
+  }
+
+  // The rect grown by one pixel on each side that exists. That band holds every
+  // sample the interpolation reads, and pulling it in as one region keeps this
+  // to a single `getImageData` for the whole patch rather than one per pixel.
+  const sx = hasLeft ? x - 1 : x;
+  const sy = hasTop ? y - 1 : y;
+  const sw = w + (hasLeft ? 1 : 0) + (hasRight ? 1 : 0);
+  const sh = h + (hasTop ? 1 : 0) + (hasBottom ? 1 : 0);
+
+  const ring = scratch(sw, sh);
+  if (!ring) return null;
+  ring.imageSmoothingEnabled = false;
+  ring.drawImage(src, sx, sy, sw, sh, 0, 0, sw, sh);
+
+  let px: Uint8ClampedArray;
+  try {
+    px = ring.getImageData(0, 0, sw, sh).data;
+  } catch {
+    // Only a tainted canvas reaches here, and nothing in the app loads an image
+    // that can taint one (M2.5 §0). Drawing nothing still beats throwing out of
+    // render() and blanking the stage.
+    return null;
+  }
+
+  // Ring-space coordinates: where patch pixel (0,0) sits, and which row/column
+  // of the band holds each sample.
+  const ox = hasLeft ? 1 : 0;
+  const oy = hasTop ? 1 : 0;
+  const leftX = 0;
+  const rightX = sw - 1;
+  const topY = 0;
+  const bottomY = sh - 1;
+
+  // The horizontal pair and the vertical pair are interpolated separately and
+  // the two results averaged; an axis with no samples at all drops out and the
+  // other one carries the pixel alone.
+  const hShare = hasLeft || hasRight ? (hasTop || hasBottom ? 0.5 : 1) : 0;
+  const vShare = hasTop || hasBottom ? (hasLeft || hasRight ? 0.5 : 1) : 0;
+
+  // Inverse distance to each edge, normalised — for two samples that is exactly
+  // a linear ramp, so a pixel one px from the left edge is dominated by the
+  // left sample. Column weights depend only on the column, so hoist them.
+  const wLeft = new Float64Array(w);
+  const wRight = new Float64Array(w);
+  for (let i = 0; i < w; i++) {
+    const dL = i + 1;
+    const dR = w - i;
+    wLeft[i] = (hasLeft ? (hasRight ? dR / (dL + dR) : 1) : 0) * hShare;
+    wRight[i] = (hasRight ? (hasLeft ? dL / (dL + dR) : 1) : 0) * hShare;
+  }
+
+  for (let j = 0; j < h; j++) {
+    const dT = j + 1;
+    const dB = h - j;
+    const wTop = (hasTop ? (hasBottom ? dB / (dT + dB) : 1) : 0) * vShare;
+    const wBottom = (hasBottom ? (hasTop ? dT / (dT + dB) : 1) : 0) * vShare;
+    // Row samples: constant across the row. A missing edge carries weight 0, so
+    // the index it points at is never actually contributed.
+    const li = ((oy + j) * sw + leftX) * 4;
+    const ri = ((oy + j) * sw + rightX) * 4;
+
+    for (let i = 0; i < w; i++) {
+      const ti = (topY * sw + ox + i) * 4;
+      const bi = (bottomY * sw + ox + i) * 4;
+      const wl = wLeft[i];
+      const wr = wRight[i];
+      const o = (j * w + i) * 4;
+      for (let c = 0; c < 4; c++) {
+        data[o + c] = wl * px[li + c] + wr * px[ri + c] + wTop * px[ti + c] + wBottom * px[bi + c];
+      }
+    }
+  }
+
+  out.putImageData(dst, 0, 0);
+  return out.canvas;
+}
+
+/**
+ * Mean colour of the whole image, taken from a small downscale rather than a
+ * full-resolution read. Only reached when a selection covers the entire picture
+ * and has no ring to sample.
+ */
+function meanColor(
+  src: CanvasImageSource,
+  doc: EditorDoc
+): [number, number, number, number] | null {
+  const w = clamp(Math.round(doc.width), 1, 64);
+  const h = clamp(Math.round(doc.height), 1, 64);
+  const small = scratch(w, h);
+  if (!small) return null;
+  small.imageSmoothingEnabled = true;
+  small.imageSmoothingQuality = 'high';
+  small.drawImage(src, 0, 0, doc.width, doc.height, 0, 0, w, h);
+
+  let px: Uint8ClampedArray;
+  try {
+    px = small.getImageData(0, 0, w, h).data;
+  } catch {
+    return null;
+  }
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let a = 0;
+  for (let i = 0; i < px.length; i += 4) {
+    r += px[i];
+    g += px[i + 1];
+    b += px[i + 2];
+    a += px[i + 3];
+  }
+  const n = px.length / 4;
+  return [r / n, g / n, b / n, a / n];
 }
 
 function scratch(width: number, height: number): CanvasRenderingContext2D | null {

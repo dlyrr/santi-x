@@ -36,6 +36,7 @@
   import Toolbar, { TOOLS } from "$lib/editor/Toolbar.svelte";
   import Stage from "$lib/editor/stage/Stage.svelte";
   import { doc } from "$lib/editor/doc.svelte";
+  import type { ShapeKind, ShapePatch } from "$lib/editor/doc.svelte";
   import { renderToPng } from "$lib/editor/export";
   import { toolHitForKey } from "$lib/editor/tools";
   import type { ToolId, ToolOptions } from "$lib/editor/tools";
@@ -273,6 +274,27 @@
    * selected one — but only with the fields that shape actually owns, so a
    * `fill` toggle never lands a dead property on an arrow.
    */
+  /**
+   * The fields of `patch` the selected shape actually owns. An erase owns none
+   * of them — its fill comes from the image (M2.11 §2) — and every other kind
+   * drops whatever the renderer would ignore.
+   */
+  function shapeFields(kind: ShapeKind, patch: Partial<ToolOptions>): ShapePatch {
+    switch (kind) {
+      case "rect":
+      case "ellipse":
+        return prune({ color: patch.color, stroke: patch.stroke, fill: patch.fill });
+      case "text":
+        return prune({ color: patch.color, size: patch.textSize });
+      case "redact":
+        return prune({ mode: patch.redactMode, amount: patch.redactAmount });
+      case "erase":
+        return {};
+      default:
+        return prune({ color: patch.color, stroke: patch.stroke });
+    }
+  }
+
   function applyOptions(patch: Partial<ToolOptions>): void {
     opts = { ...opts, ...patch };
 
@@ -281,28 +303,22 @@
     const shape = doc.shapes.find((s) => s.id === id);
     if (!shape) return;
 
-    if (optionDrag && !doc.dragging) doc.beginDrag("restyle");
+    const next = shapeFields(shape.kind, patch);
+    /*
+     * Nothing survived the filter, so this control does not describe the
+     * selected shape. The options bar itself already hides such a control, but
+     * a tool shortcut carries a preset with it — pressing `B` with an erase
+     * selected lands here with a `redactMode` the erase has no use for.
+     *
+     * Bailing BEFORE `beginDrag` and `updateShape` is the point: both push an
+     * undo entry, and an entry that restores identical pixels is worse than no
+     * entry — Ctrl+Z would appear to do nothing, and the document would be
+     * marked dirty enough to prompt on close.
+     */
+    if (Object.keys(next).length === 0) return;
 
-    switch (shape.kind) {
-      case "rect":
-      case "ellipse":
-        doc.updateShape(
-          id,
-          prune({ color: patch.color, stroke: patch.stroke, fill: patch.fill })
-        );
-        break;
-      case "text":
-        doc.updateShape(id, prune({ color: patch.color, size: patch.textSize }));
-        break;
-      case "redact":
-        doc.updateShape(
-          id,
-          prune({ mode: patch.redactMode, amount: patch.redactAmount })
-        );
-        break;
-      default:
-        doc.updateShape(id, prune({ color: patch.color, stroke: patch.stroke }));
-    }
+    if (optionDrag && !doc.dragging) doc.beginDrag("restyle");
+    doc.updateShape(id, next);
   }
 
   function deleteSelected(): void {

@@ -45,7 +45,9 @@
     { label: "Shapes", tools: ["rect", "ellipse", "line", "arrow"] },
     { label: "Drawing", tools: ["pen", "highlight"] },
     { label: "Text", tools: ["text", "step"] },
-    { label: "Redaction", tools: ["redact"] }
+    // Content removal, not shapes: both replace what was there rather than draw
+    // on top of it (M2.11 §4).
+    { label: "Redaction", tools: ["redact", "erase"] }
   ];
 
   const TOOL_GROUPS: readonly { label: string; tools: readonly ToolSpec[] }[] = GROUPS.map((g) => ({
@@ -134,6 +136,21 @@
   );
 
   const has = (option: ToolOption): boolean => shown.includes(option);
+
+  /**
+   * Smart eraser is the first overlay tool with no options at all — it takes its
+   * fill from the image, so there is nothing to style (M2.11 §2).
+   *
+   * The Style group is still rendered, carrying a hint instead of controls, and
+   * this is not cosmetic. The bar is centred on the top edge
+   * (`left: 50%; translateX(-50%)`), so its width is shared out equally to both
+   * sides: folding the group away entirely took ~220px out of the middle of the
+   * bar and slid every tool button ~110px sideways *at the moment the eraser was
+   * clicked*, leaving the pointer over some other tool's button and its tooltip.
+   * Keeping the slot occupied holds the switch to the same small reflow every
+   * other tool change already causes.
+   */
+  const hasOptions = $derived(shown.length > 0);
 
   /**
    * Spread onto every slider, same as the editor's toolbar. `pointerup` is the
@@ -335,128 +352,135 @@
   <span class="rule" aria-hidden="true"></span>
 
   <div class="group opts" role="group" aria-label="Style">
-    {#if has("color")}
-      <div class="swatches" role="radiogroup" aria-label="Annotation colour">
-        {#each PRESETS as preset, i (preset.hex)}
+    {#if !hasOptions}
+      <!-- Keeps the slot occupied so the bar does not collapse around the
+           eraser, and says why there is nothing to set — an empty group would
+           read as a broken toolbar. -->
+      <span class="hint">Fills from the surrounding pixels</span>
+    {:else}
+      {#if has("color")}
+        <div class="swatches" role="radiogroup" aria-label="Annotation colour">
+          {#each PRESETS as preset, i (preset.hex)}
+            <button
+              type="button"
+              role="radio"
+              class="swatch"
+              class:on={i === activeSwatch}
+              style="--swatch:{preset.hex}"
+              aria-checked={i === activeSwatch}
+              aria-label={preset.name}
+              tabindex={i === swatchTabIndex ? 0 : -1}
+              bind:this={swatchEls[i]}
+              onpointerdown={keepFocus}
+              onclick={() => pickColour(preset.hex)}
+              onkeydown={(e) => onSwatchKeydown(e, i)}
+            ></button>
+          {/each}
+        </div>
+
+        <!-- Doubles as the current-colour readout, so a custom colour that matches
+             no swatch is still visible at a glance. -->
+        <label class="custom" class:on={activeSwatch === -1}>
+          <span class="sr">Custom colour</span>
+          <input
+            type="color"
+            value={colour}
+            oninput={(e) => onOptions({ color: e.currentTarget.value })}
+          />
+        </label>
+      {/if}
+
+      {#if has("stroke")}
+        <label class="ctl">
+          <span class="sr">Stroke width</span>
+          <input
+            class="slider"
+            type="range"
+            min="1"
+            max="24"
+            step="1"
+            value={opts.stroke}
+            aria-label="Stroke width"
+            {...sliderGesture}
+            oninput={(e) => onOptions({ stroke: e.currentTarget.valueAsNumber })}
+          />
+          <output class="ctl-value tnum">{opts.stroke}</output>
+        </label>
+      {/if}
+
+      {#if has("fill")}
+        <button
+          type="button"
+          class="pill"
+          class:on={opts.fill}
+          aria-pressed={opts.fill}
+          onpointerdown={keepFocus}
+          onclick={() => onOptions({ fill: !opts.fill })}
+        >
+          Fill
+        </button>
+      {/if}
+
+      {#if has("textSize")}
+        <label class="ctl">
+          <span class="sr">Text size</span>
+          <input
+            class="slider"
+            type="range"
+            min="10"
+            max="120"
+            step="2"
+            value={opts.textSize}
+            aria-label="Text size"
+            {...sliderGesture}
+            oninput={(e) => onOptions({ textSize: e.currentTarget.valueAsNumber })}
+          />
+          <output class="ctl-value tnum">{opts.textSize}</output>
+        </label>
+      {/if}
+
+      {#if has("redactMode")}
+        <div class="seg" role="group" aria-label="Redaction mode">
           <button
             type="button"
-            role="radio"
-            class="swatch"
-            class:on={i === activeSwatch}
-            style="--swatch:{preset.hex}"
-            aria-checked={i === activeSwatch}
-            aria-label={preset.name}
-            tabindex={i === swatchTabIndex ? 0 : -1}
-            bind:this={swatchEls[i]}
+            class="seg-btn"
+            class:on={opts.redactMode === "blur"}
+            aria-pressed={opts.redactMode === "blur"}
             onpointerdown={keepFocus}
-            onclick={() => pickColour(preset.hex)}
-            onkeydown={(e) => onSwatchKeydown(e, i)}
-          ></button>
-        {/each}
-      </div>
+            onclick={() => onOptions({ redactMode: "blur" })}
+          >
+            Blur
+          </button>
+          <button
+            type="button"
+            class="seg-btn"
+            class:on={opts.redactMode === "pixelate"}
+            aria-pressed={opts.redactMode === "pixelate"}
+            onpointerdown={keepFocus}
+            onclick={() => onOptions({ redactMode: "pixelate" })}
+          >
+            Pixelate
+          </button>
+        </div>
+      {/if}
 
-      <!-- Doubles as the current-colour readout, so a custom colour that matches
-           no swatch is still visible at a glance. -->
-      <label class="custom" class:on={activeSwatch === -1}>
-        <span class="sr">Custom colour</span>
-        <input
-          type="color"
-          value={colour}
-          oninput={(e) => onOptions({ color: e.currentTarget.value })}
-        />
-      </label>
-    {/if}
-
-    {#if has("stroke")}
-      <label class="ctl">
-        <span class="sr">Stroke width</span>
-        <input
-          class="slider"
-          type="range"
-          min="1"
-          max="24"
-          step="1"
-          value={opts.stroke}
-          aria-label="Stroke width"
-          {...sliderGesture}
-          oninput={(e) => onOptions({ stroke: e.currentTarget.valueAsNumber })}
-        />
-        <output class="ctl-value tnum">{opts.stroke}</output>
-      </label>
-    {/if}
-
-    {#if has("fill")}
-      <button
-        type="button"
-        class="pill"
-        class:on={opts.fill}
-        aria-pressed={opts.fill}
-        onpointerdown={keepFocus}
-        onclick={() => onOptions({ fill: !opts.fill })}
-      >
-        Fill
-      </button>
-    {/if}
-
-    {#if has("textSize")}
-      <label class="ctl">
-        <span class="sr">Text size</span>
-        <input
-          class="slider"
-          type="range"
-          min="10"
-          max="120"
-          step="2"
-          value={opts.textSize}
-          aria-label="Text size"
-          {...sliderGesture}
-          oninput={(e) => onOptions({ textSize: e.currentTarget.valueAsNumber })}
-        />
-        <output class="ctl-value tnum">{opts.textSize}</output>
-      </label>
-    {/if}
-
-    {#if has("redactMode")}
-      <div class="seg" role="group" aria-label="Redaction mode">
-        <button
-          type="button"
-          class="seg-btn"
-          class:on={opts.redactMode === "blur"}
-          aria-pressed={opts.redactMode === "blur"}
-          onpointerdown={keepFocus}
-          onclick={() => onOptions({ redactMode: "blur" })}
-        >
-          Blur
-        </button>
-        <button
-          type="button"
-          class="seg-btn"
-          class:on={opts.redactMode === "pixelate"}
-          aria-pressed={opts.redactMode === "pixelate"}
-          onpointerdown={keepFocus}
-          onclick={() => onOptions({ redactMode: "pixelate" })}
-        >
-          Pixelate
-        </button>
-      </div>
-    {/if}
-
-    {#if has("redactAmount")}
-      <label class="ctl">
-        <span class="sr">{opts.redactMode === "blur" ? "Blur radius" : "Block size"}</span>
-        <input
-          class="slider"
-          type="range"
-          min="2"
-          max="40"
-          step="1"
-          value={opts.redactAmount}
-          aria-label="Redaction amount"
-          {...sliderGesture}
-          oninput={(e) => onOptions({ redactAmount: e.currentTarget.valueAsNumber })}
-        />
-        <output class="ctl-value tnum">{opts.redactAmount}</output>
-      </label>
+      {#if has("redactAmount")}
+        <label class="ctl">
+          <span class="sr">{opts.redactMode === "blur" ? "Blur radius" : "Block size"}</span>
+          <input
+            class="slider"
+            type="range"
+            min="2"
+            max="40"
+            step="1"
+            value={opts.redactAmount}
+            aria-label="Redaction amount"
+            {...sliderGesture}
+            oninput={(e) => onOptions({ redactAmount: e.currentTarget.valueAsNumber })}
+          />
+          <output class="ctl-value tnum">{opts.redactAmount}</output>
+        </label>
+      {/if}
     {/if}
   </div>
 
@@ -784,6 +808,16 @@
   .custom input::-webkit-color-swatch {
     border: none;
     border-radius: 2px;
+  }
+
+  /* Stands in for the controls a tool with no options would leave missing, so
+     the centred bar keeps roughly its width across the switch. */
+  .hint {
+    flex: none;
+    color: var(--text-faint);
+    font-size: 11px;
+    line-height: 1;
+    white-space: nowrap;
   }
 
   /* Icon-only everywhere else, so the numeric controls drop their text label

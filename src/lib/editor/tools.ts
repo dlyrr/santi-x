@@ -27,6 +27,7 @@ export type ToolId =
   | 'text'
   | 'highlight'
   | 'redact'
+  | 'erase'
   | 'step'
   | 'crop';
 
@@ -166,6 +167,22 @@ export const TOOLS: readonly ToolDef[] = [
     shift: 'Square'
   },
   {
+    id: 'erase',
+    label: 'Smart eraser',
+    // `X` is OURS, not ShareX's: ShareX leaves this tool unbound — its issue
+    // tracker carries open requests for a key — and `X` is its Cut Out key,
+    // which santi.sharex does not implement. So it is free, and it sits beside
+    // the other content-removal tools. Do not "correct" it to match ShareX.
+    key: 'x',
+    cursor: 'crosshair',
+    // Deliberately empty: the fill comes from the image, so neither colour nor
+    // stroke does anything. The options bar keys off this array, so anything
+    // listed here would be a dead control.
+    options: [],
+    creates: 'erase',
+    shift: 'Square'
+  },
+  {
     id: 'step',
     label: 'Step',
     key: 'i',
@@ -237,6 +254,9 @@ export function optionsForKind(kind: ShapeKind): readonly ToolOption[] {
       return ['color'];
     case 'redact':
       return ['redactMode', 'redactAmount'];
+    // The eraser fills from the image: it has nothing to configure (M2.11 §2).
+    case 'erase':
+      return [];
     case 'rect':
     case 'ellipse':
       return ['color', 'stroke', 'fill'];
@@ -290,6 +310,7 @@ function hits(shape: Shape, p: Point, tol: number): boolean {
       return hitsEllipse(p, normalizeRect(shape.rect), shape.fill, half + tol);
     case 'highlight':
     case 'redact':
+    case 'erase':
       return insideRect(p, normalizeRect(shape.rect), tol);
     case 'text':
       return insideRect(p, textBounds(shape), tol);
@@ -360,7 +381,8 @@ export function handlesFor(shape: Shape): Handle[] {
     shape.kind === 'rect' ||
     shape.kind === 'ellipse' ||
     shape.kind === 'highlight' ||
-    shape.kind === 'redact'
+    shape.kind === 'redact' ||
+    shape.kind === 'erase'
   ) {
     const r = normalizeRect(shape.rect);
     return RECT_HANDLES.map((h) => ({
@@ -391,7 +413,8 @@ export function resizePatch(shape: Shape, handle: HandleId, point: Point): Shape
     shape.kind !== 'rect' &&
     shape.kind !== 'ellipse' &&
     shape.kind !== 'highlight' &&
-    shape.kind !== 'redact'
+    shape.kind !== 'redact' &&
+    shape.kind !== 'erase'
   ) {
     return {};
   }
@@ -422,6 +445,7 @@ export function movePatch(shape: Shape, dx: number, dy: number): ShapePatch {
     case 'ellipse':
     case 'highlight':
     case 'redact':
+    case 'erase':
       return { rect: { ...shape.rect, x: shape.rect.x + dx, y: shape.rect.y + dy } };
     case 'pen':
       return { points: shape.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) };
@@ -443,8 +467,10 @@ export function shapeBounds(shape: Shape): Rect {
     case 'rect':
     case 'ellipse':
       return padRect(normalizeRect(shape.rect), shape.fill ? 0 : pad);
+    // Flat fills with no stroke to pad by: the bounds are exactly the rect.
     case 'highlight':
     case 'redact':
+    case 'erase':
       return normalizeRect(shape.rect);
     case 'text':
       return textBounds(shape);

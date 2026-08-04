@@ -117,6 +117,15 @@
     droplet: [
       "M12 21.5a6.8 6.8 0 0 0 6.8-6.8c0-2-1-3.9-2.9-5.5S12.5 5.4 12 2.9c-.5 2.5-2 4.7-3.9 6.3S5.2 12.7 5.2 14.7A6.8 6.8 0 0 0 12 21.5z"
     ],
+    /* Smart eraser (M2.11): a tilted eraser block with its ferrule band, plus a
+       sparkle for the "smart" part. The block sits low-left and the sparkle
+       high-right so the silhouette does not read as `highlighter`, whose nib
+       occupies the opposite diagonal. */
+    eraser: [
+      "M3.42 14.08 10.78 6.72a1.3 1.3 0 0 1 1.84 0l3.06 3.06a1.3 1.3 0 0 1 0 1.84l-7.36 7.36a1.3 1.3 0 0 1-1.84 0l-3.06-3.06a1.3 1.3 0 0 1 0-1.84z",
+      "m8.6 9.15 4.65 4.65",
+      "M19.2 2.9 19.92 5.08 22.1 5.8 19.92 6.52 19.2 8.7 18.48 6.52 16.3 5.8 18.48 5.08z"
+    ],
     step: [
       "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z",
       "m10.4 9.8 2.4-1.4V16",
