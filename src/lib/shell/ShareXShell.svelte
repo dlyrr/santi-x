@@ -25,6 +25,7 @@
   import Toggle from "$lib/components/Toggle.svelte";
   import { toast } from "$lib/components/Toast.svelte";
   import CaptureView from "$lib/views/CaptureView.svelte";
+  import DestinationsView from "$lib/views/DestinationsView.svelte";
   import HistoryView from "$lib/views/HistoryView.svelte";
   import SettingsView from "$lib/views/SettingsView.svelte";
   import { settings } from "$lib/stores/settings.svelte";
@@ -43,10 +44,14 @@
   } from "$lib/api";
 
   /**
-   * The `View` members route into the shared views; the other three are pages
-   * that exist only in this shell, because only ShareX's menu asks for them.
+   * The `View` members route into the shared views; the rest are pages that
+   * exist only in this shell, because only ShareX's menu asks for them.
+   *
+   * `destinations` is not in `View` on purpose: the default shell's sidebar has
+   * three fixed entries and reaches the same form through Settings, so widening
+   * `View` would add a route only one of the two shells can navigate to.
    */
-  type Pane = View | "hotkeys" | "tools" | "tasks";
+  type Pane = View | "hotkeys" | "tools" | "tasks" | "destinations";
 
   /**
    * ShareX's menu icons, and the one place this file is allowed a literal colour.
@@ -93,8 +98,16 @@
   type Ink = (typeof SHAREX_ICON_INK)[keyof typeof SHAREX_ICON_INK];
 
   type MenuRow =
-    | { kind: "pane"; label: string; icon: IconName; ink: Ink; pane: Pane }
-    | { kind: "action"; label: string; icon: IconName; ink: Ink; run: () => void }
+    | { kind: "pane"; label: string; icon: IconName; ink: Ink; pane: Pane; hint?: string }
+    | {
+        kind: "action";
+        label: string;
+        icon: IconName;
+        ink: Ink;
+        run: () => void;
+        /** Shown on hover when the row goes somewhere its label does not name. */
+        hint?: string;
+      }
     | {
         kind: "soon";
         label: string;
@@ -226,13 +239,21 @@
         ink: SHAREX_ICON_INK.capture,
         pane: "capture"
       },
+      // M3 shipped uploading, so this can no longer sit here wearing an "M3"
+      // tag — a milestone that has already landed is as inaccurate as a fake
+      // feature. Uploading is an action *on a capture* rather than a screen of
+      // its own, so the row opens the screen where those captures are, the same
+      // way Tools › Scrolling capture opens Capture. An `action` and not a
+      // `pane`, so History's own row keeps the selected highlight to itself.
       {
-        kind: "soon",
+        kind: "action",
         label: "Upload",
         icon: "upload",
         ink: SHAREX_ICON_INK.upload,
-        milestone: "M3",
-        note: "Uploading arrives in M3, with the destinations that receive it."
+        hint: "Opens History, where every capture has an Upload action. Nothing is uploaded until you press it.",
+        run: () => {
+          pane = "history";
+        }
       },
       {
         kind: "soon",
@@ -254,13 +275,14 @@
         ink: SHAREX_ICON_INK.tasks,
         pane: "tasks"
       },
+      // Genuinely live as of M3, not merely enabled: it routes into the real
+      // destination picker and the real credential forms.
       {
-        kind: "soon",
+        kind: "pane",
         label: "Destinations",
         icon: "cloud",
         ink: SHAREX_ICON_INK.destinations,
-        milestone: "M3",
-        note: "Upload destinations arrive in M3."
+        pane: "destinations"
       }
     ],
     [
@@ -425,6 +447,7 @@
               class="item"
               class:active={isActive(row)}
               aria-current={isActive(row) ? "page" : undefined}
+              title={row.hint}
               onclick={() => activate(row)}
             >
               <span class="ico" style="--sx-ink: {row.ink}"><Icon name={row.icon} size={14} /></span>
@@ -442,7 +465,11 @@
     {:else if pane === "history"}
       <HistoryView />
     {:else if pane === "settings"}
-      <SettingsView />
+      <!-- This shell has its own Destinations row, so Settings does not repeat
+           the form: one screen owns it, and the menu says which. -->
+      <SettingsView showDestinations={false} />
+    {:else if pane === "destinations"}
+      <DestinationsView />
     {:else if pane === "tools"}
       <section class="flat">
         <h1 class="flat-title">Tools</h1>

@@ -4,6 +4,7 @@
 //! `settings.json`, `history.json`, `thumbs/{id}.png`.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,29 @@ pub fn normalize_theme(theme: &str) -> String {
         theme.to_string()
     } else {
         DEFAULT_THEME.to_string()
+    }
+}
+
+/// Every upload destination M3 implements, by id (M3 §6). Mirrored by
+/// `DESTINATIONS` in `src/lib/types.ts`, and parsed back into
+/// `upload::DestinationKind` on the way to a transfer.
+pub const DESTINATIONS: [&str; 3] = ["imgur", "custom", "ftp"];
+
+/// [`Settings::destination`] when nothing is set up — the default, and the state
+/// in which no capture can leave the machine however the other switches are set
+/// (M3 §1).
+pub const DESTINATION_NONE: &str = "none";
+
+/// `destination` is a plain `String` on the wire for the same reason `theme` is,
+/// and carries the same risk: a hand-edited or newer-build value naming a
+/// destination this build cannot dispatch. Unknown ids normalise to
+/// [`DESTINATION_NONE`] rather than to some destination — "I did not recognise
+/// that, so nothing uploads" is the only safe reading (M3 §1).
+pub fn normalize_destination(kind: &str) -> String {
+    if DESTINATIONS.contains(&kind) {
+        kind.to_string()
+    } else {
+        DESTINATION_NONE.to_string()
     }
 }
 
@@ -156,8 +180,139 @@ pub struct Settings {
     pub scroll_step: i32,
     #[serde(default = "default_scroll_max_frames")]
     pub scroll_max_frames: u32,
+    /// M3 §1. **Upload every capture, without being asked.**
+    ///
+    /// Names its default like the rest, and the default is `false`. That is the
+    /// single most important line in this file: a bare `#[serde(default)]`
+    /// would give the same answer today, but this field must never be able to
+    /// arrive `true` from a `settings.json` that predates it, from a container
+    /// default that someone changes later, or from a `Settings::default()` that
+    /// gets rewritten in a hurry. A screen capture tool that uploads without
+    /// being asked is a data-exfiltration tool with a friendly icon.
+    ///
+    /// Even when it is on, [`Settings::destination`] defaults to
+    /// [`DESTINATION_NONE`], so there is nowhere for a capture to go until the
+    /// user sets a destination up themselves.
+    #[serde(default = "default_auto_upload")]
+    pub auto_upload: bool,
+    /// M3 §6. Put the returned link on the clipboard. Defaults to *true* — it is
+    /// the point of uploading — so it names its default.
+    #[serde(default = "default_true")]
+    pub copy_url_after_upload: bool,
+    /// M3 §6. Which destination an upload goes to: `"none"` (the default),
+    /// `"imgur"`, `"custom"` or `"ftp"`. Normalised on the way in and on the way
+    /// out by [`normalize_destination`].
+    #[serde(default = "default_destination")]
+    pub destination: String,
+    /// M3 §4/§5. **Non-secret** per-destination configuration, and only that:
+    /// passwords and API keys live in Windows Credential Manager
+    /// (`upload::secrets`), never here. Imgur has no non-secret configuration at
+    /// all — its client ID is a secret — so it has no struct.
+    ///
+    /// Both are the *stored* form. `upload::custom` and `upload::ftp` re-validate
+    /// them into their own ready-to-send types on the way out, because
+    /// `settings.json` is a text file a user can edit.
+    #[serde(default)]
+    pub custom_uploader: CustomUploaderSettings,
+    #[serde(default)]
+    pub ftp: FtpSettings,
     pub hotkeys: Hotkeys,
 }
+
+/// An imported ShareX `.sxcu`, minus anything secret (M3 §4).
+///
+/// Field names mirror the `.sxcu` vocabulary rather than being renamed to
+/// something prettier: this is a transcription of a file format, and a user
+/// comparing it against the original in Notepad should recognise every line.
+/// `upload::custom::import` is what validates it — an unsupported
+/// `RequestBodyType` is rejected *there*, with the field named, rather than
+/// stored and then mysteriously failing at upload time.
+///
+/// `BTreeMap` rather than `HashMap` so `settings.json` does not reshuffle its
+/// own keys on every write.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CustomUploaderSettings {
+    /// `Name` from the file, for the UI to show. Empty means "nothing imported".
+    pub name: String,
+    /// `"POST"` or `"PUT"`.
+    pub request_method: String,
+    pub request_url: String,
+    /// Header values that looked like credentials are **not** here — their
+    /// names are in [`Self::secret_headers`] and their values are in the
+    /// credential store (M3 §2, §4).
+    pub headers: BTreeMap<String, String>,
+    /// `Parameters`, or `Arguments` in older files.
+    pub parameters: BTreeMap<String, String>,
+    /// `"MultipartFormData"` or `"Binary"`.
+    pub body: String,
+    pub file_form_name: String,
+    /// Response templates: `$json:path.to.field$` / `$response$`.
+    pub url: String,
+    pub thumbnail_url: String,
+    pub deletion_url: String,
+    /// Header names whose values are held in Windows Credential Manager under
+    /// `santi.sharex/custom/<header-name>`. The list of names is not itself a
+    /// secret — it is what lets Settings show a "Configured" indicator, and what
+    /// tells the uploader which headers to fetch before a request.
+    pub secret_headers: Vec<String>,
+}
+
+/// Plain FTP and explicit FTPS (M3 §5). **No SFTP**: it needs an SSH stack, and
+/// half-implementing it would be worse than saying so — hence
+/// [`FTP_SECURITY_SFTP`], which exists so the picker can show it as unavailable
+/// and so a settings file naming it produces a sentence rather than a puzzle.
+///
+/// The password is a secret and is *not* in here — it lives under
+/// `santi.sharex/ftp/password`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FtpSettings {
+    pub host: String,
+    /// The IANA control port unless the user says otherwise. Named default: a
+    /// bare `#[serde(default)]` would hand an existing file port 0.
+    #[serde(default = "default_ftp_port")]
+    pub port: u16,
+    pub username: String,
+    /// Directory on the server, e.g. `/public_html/shots`. Empty means wherever
+    /// the login lands.
+    pub remote_dir: String,
+    /// Passive mode — the default, and the only one that works from behind a
+    /// consumer router without port forwarding. Named default for the same
+    /// reason as `port`.
+    #[serde(default = "default_true")]
+    pub passive: bool,
+    /// One of [`FTP_SECURITY_PLAIN`], [`FTP_SECURITY_EXPLICIT_TLS`],
+    /// [`FTP_SECURITY_SFTP`]. A plain `String` rather than an enum for the same
+    /// reason `theme` is: an unrecognised value must not make the whole file
+    /// fail to parse and take every other setting down with it.
+    #[serde(default = "default_ftp_security")]
+    pub security: String,
+    /// Public address the remote directory is served at, so the copied link
+    /// points at the web host rather than at an `ftp://` path.
+    pub url_prefix: String,
+}
+
+/// The FTP transport values. Mirrored in `upload::ftp`, which is the only thing
+/// that acts on them, and in the frontend's picker.
+pub const FTP_SECURITY_PLAIN: &str = "plain";
+pub const FTP_SECURITY_EXPLICIT_TLS: &str = "explicitTls";
+pub const FTP_SECURITY_SFTP: &str = "sftp";
+
+impl Default for FtpSettings {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: default_ftp_port(),
+            username: String::new(),
+            remote_dir: String::new(),
+            passive: true,
+            security: default_ftp_security(),
+            url_prefix: String::new(),
+        }
+    }
+}
+
 
 /// Bounds on [`Settings::loupe_zoom`] (M2.9 §1). A hand-edited `0` would be a
 /// division by zero in the overlay's loupe maths, so it is normalised on the way
@@ -201,6 +356,27 @@ fn default_scroll_max_frames() -> u32 {
     60
 }
 
+/// M3 §1, spelled out rather than inferred. See [`Settings::auto_upload`].
+fn default_auto_upload() -> bool {
+    false
+}
+
+fn default_destination() -> String {
+    DESTINATION_NONE.to_string()
+}
+
+fn default_ftp_port() -> u16 {
+    21
+}
+
+/// Plain FTP is what an FTP account is unless the server was set up for TLS, so
+/// it is the value a config that never said gets. The UI is where the "this
+/// sends your password in clear text" sentence belongs (M3 §5) — a default that
+/// silently failed to connect everywhere would not be safer, just broken.
+fn default_ftp_security() -> String {
+    FTP_SECURITY_PLAIN.to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -227,6 +403,11 @@ impl Default for Settings {
             scroll_delay_ms: default_scroll_delay_ms(),
             scroll_step: default_scroll_step(),
             scroll_max_frames: default_scroll_max_frames(),
+            auto_upload: default_auto_upload(),
+            copy_url_after_upload: true,
+            destination: default_destination(),
+            custom_uploader: CustomUploaderSettings::default(),
+            ftp: FtpSettings::default(),
             hotkeys: Hotkeys::default(),
         }
     }
@@ -247,6 +428,29 @@ pub struct CaptureRecord {
     pub size_bytes: u64,
     pub saved: bool,
     pub copied: bool,
+    /// M3 §6. Where this capture was uploaded to, once it has been. `None` for
+    /// every record that has not — which is every record that already exists on
+    /// disk, and stays that way unless the user asks for an upload.
+    ///
+    /// `#[serde(default)]`, and the *only* two fields in this struct that carry
+    /// it, because these are the two M3 added to a file the user already has.
+    ///
+    /// Be precise about what that attribute buys, because it is easy to trust it
+    /// for more than it does: serde already treats an `Option<T>` field as
+    /// implicitly optional, so removing the attribute would change nothing and
+    /// `tests::an_m5_history_file_still_loads_without_the_upload_fields` would
+    /// still pass — that was checked by mutation, not assumed. The attribute is
+    /// documentation and insurance against the field type changing; the *test*
+    /// pins the behaviour, which is the thing the user's 82 records depend on,
+    /// and the only edit that can break it — making either field non-`Option`
+    /// without a default — fails to compile against that same test.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The destination's "delete this upload" link, when it hands one back
+    /// (Imgur does; a `.sxcu` may). Not every destination has one, so `None` is
+    /// a normal state for an uploaded record.
+    #[serde(default)]
+    pub deletion_url: Option<String>,
 }
 
 /// The full-desktop snapshot the region overlay draws on top of. Coordinates are
@@ -346,6 +550,9 @@ pub fn load_settings(app: &AppHandle) -> Settings {
     }
     settings.theme = normalize_theme(&settings.theme);
     settings.loupe_zoom = normalize_loupe_zoom(settings.loupe_zoom);
+    // An unrecognised destination becomes "none", so a settings file this build
+    // cannot make sense of uploads nowhere rather than somewhere (M3 §1).
+    settings.destination = normalize_destination(&settings.destination);
     settings
 }
 
@@ -573,6 +780,52 @@ mod tests {
         assert_ne!(s.scroll_max_frames, 0);
     }
 
+    /// M3 §1, guarded from three directions at once. This is the test that has
+    /// to fail loudly if `auto_upload` ever acquires a `true` default by
+    /// accident — through the container default, through `Settings::default()`,
+    /// or through a settings file written before the field existed.
+    #[test]
+    fn auto_upload_is_off_by_default_and_stays_off_for_an_existing_settings_file() {
+        assert!(!Settings::default().auto_upload);
+        assert!(!default_auto_upload());
+
+        let from_empty: Settings = serde_json::from_str("{}").expect("{} must parse");
+        assert!(!from_empty.auto_upload);
+
+        let existing: Settings =
+            serde_json::from_str(M2_11_SETTINGS).expect("M2.11 settings must parse");
+        assert!(
+            !existing.auto_upload,
+            "an existing settings.json must not be able to acquire auto-upload"
+        );
+        // And with it off there is still nowhere for a capture to go.
+        assert_eq!(existing.destination, DESTINATION_NONE);
+        assert!(existing.ftp.host.is_empty());
+        assert!(existing.custom_uploader.request_url.is_empty());
+
+        // And the rest of M3's settings arrive at their documented values
+        // rather than at zero/empty — a port of 0 and an active-mode transfer
+        // would be an FTP destination that arrives broken on every machine that
+        // already has a settings file.
+        assert!(existing.copy_url_after_upload);
+        assert_eq!(existing.ftp.port, 21);
+        assert!(existing.ftp.passive);
+        assert_eq!(existing.ftp.security, FTP_SECURITY_PLAIN);
+    }
+
+    /// A destination this build cannot dispatch must not be dispatched to. The
+    /// unknown value is not preserved, on the theory that "upload nowhere" is
+    /// the only safe reading of "I do not know what that is".
+    #[test]
+    fn an_unknown_destination_normalizes_to_none() {
+        assert_eq!(normalize_destination("imgur"), "imgur");
+        assert_eq!(normalize_destination("ftp"), "ftp");
+        assert_eq!(normalize_destination("custom"), "custom");
+        assert_eq!(normalize_destination("s3"), DESTINATION_NONE);
+        assert_eq!(normalize_destination(""), DESTINATION_NONE);
+        assert_eq!(normalize_destination("IMGUR"), DESTINATION_NONE);
+    }
+
     /// History is a separate file and M5 did not touch `CaptureRecord`, but the
     /// new `"scroll"` kind travels in it. An existing record must still load,
     /// and a `scroll` one must round-trip.
@@ -590,5 +843,84 @@ mod tests {
         assert_eq!(records[0].kind, "region");
         assert_eq!(records[0].width, 316);
         assert!(records[0].saved && records[0].copied);
+    }
+
+    /// M3 §6 added `url` and `deletionUrl` to a struct that has 82 real records
+    /// on this machine's disk, none of which carry either key. A `CaptureRecord`
+    /// without `#[serde(default)]` on both would make `serde_json::from_str`
+    /// fail on the *whole array* — `load_history` swallows that into
+    /// `unwrap_or_default()`, so the failure mode is not an error message, it is
+    /// an empty gallery and 82 records overwritten with `[]` by the next
+    /// capture. This test is the thing standing between the user and that.
+    #[test]
+    fn an_m5_history_file_still_loads_without_the_upload_fields() {
+        // Shaped exactly like the file on disk: no `url`, no `deletionUrl`,
+        // several kinds, and one record that was never saved to disk.
+        let raw = r#"[
+          {"id":"1785835580740-13","name":"region_2026-08-04_04-26-20.png",
+           "path":"C:\\Users\\santi\\Pictures\\Nimbus\\region_2026-08-04_04-26-20.png",
+           "thumb":"C:\\thumbs\\1785835580740-13.png","width":316,"height":72,
+           "kind":"region","createdAt":1785835580747,"sizeBytes":5821,
+           "saved":true,"copied":true},
+          {"id":"1785835580741-14","name":"scroll_2026-08-04_04-26-21.png",
+           "path":"C:\\Users\\santi\\Pictures\\Nimbus\\scroll_2026-08-04_04-26-21.png",
+           "thumb":"C:\\thumbs\\1785835580741-14.png","width":1200,"height":8400,
+           "kind":"scroll","createdAt":1785835580748,"sizeBytes":1048576,
+           "saved":true,"copied":false},
+          {"id":"1785835580742-15","name":"fullscreen_2026-08-04_04-26-22.png",
+           "path":"","thumb":"C:\\thumbs\\1785835580742-15.png",
+           "width":3840,"height":2160,"kind":"fullscreen",
+           "createdAt":1785835580749,"sizeBytes":0,"saved":false,"copied":true}
+        ]"#;
+
+        let records: Vec<CaptureRecord> =
+            serde_json::from_str(raw).expect("an M5 history.json must still parse");
+
+        assert_eq!(records.len(), 3, "every record must survive");
+        for record in &records {
+            assert!(
+                record.url.is_none(),
+                "a record that was never uploaded must load with url: None"
+            );
+            assert!(record.deletion_url.is_none());
+            // And nothing else moved.
+            assert!(!record.id.is_empty() && !record.name.is_empty());
+        }
+        assert_eq!(records[1].kind, "scroll");
+        assert_eq!(records[1].height, 8400);
+        assert!(!records[2].saved && records[2].path.is_empty());
+    }
+
+    /// The other half of the round trip: a record that *has* been uploaded
+    /// serialises both fields and reads them back, so History can show and
+    /// re-copy the link after a restart.
+    #[test]
+    fn an_uploaded_record_round_trips_its_link() {
+        let record = CaptureRecord {
+            id: "1785835580740-13".into(),
+            name: "region.png".into(),
+            path: r"C:\shots\region.png".into(),
+            thumb: r"C:\thumbs\1785835580740-13.png".into(),
+            width: 316,
+            height: 72,
+            kind: "region".into(),
+            created_at: 1785835580747,
+            size_bytes: 5821,
+            saved: true,
+            copied: true,
+            url: Some("https://i.imgur.com/abc123.png".into()),
+            deletion_url: Some("https://imgur.com/delete/xyz".into()),
+        };
+
+        let json = serde_json::to_string(&record).expect("must serialize");
+        assert!(json.contains("\"url\""), "the link must be persisted");
+        assert!(json.contains("\"deletionUrl\""));
+
+        let back: CaptureRecord = serde_json::from_str(&json).expect("must round trip");
+        assert_eq!(back.url.as_deref(), Some("https://i.imgur.com/abc123.png"));
+        assert_eq!(
+            back.deletion_url.as_deref(),
+            Some("https://imgur.com/delete/xyz")
+        );
     }
 }

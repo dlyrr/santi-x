@@ -12,11 +12,19 @@
    */
   import Icon from '$lib/components/Icon.svelte';
   import {
+    canUploadNow,
+    cancelUpload,
+    destinationStatus,
+    errorMessage,
     getPreviewRecord,
     hideCapturePreview,
     onCapturePreview,
+    onCaptureUpdated,
     onPreviewHidden,
+    onUploadError,
+    onUploadProgress,
     openEditor,
+    uploadCapture,
     versionedAssetUrl,
     type CaptureRecord
   } from '$lib/api';
@@ -49,6 +57,32 @@
   let hovering = $state(false);
   let thumbBroken = $state(false);
 
+  /**
+   * Whether the active destination is genuinely ready to receive an upload —
+   * chosen *and* holding the credential it needs (M3 §6).
+   *
+   * The stricter test, not `destination !== 'none'` as History uses, because
+   * this card is on screen for four seconds: a button that fails a moment after
+   * the window has gone is worse than no button. Re-read on every capture,
+   * since this window outlives any number of settings changes.
+   */
+  let destReady = $state(false);
+
+  let uploading = $state(false);
+  let sent = $state(0);
+  let total = $state(0);
+
+  /** The last upload's outcome, in one short line. Empty until there is one. */
+  let uploadNote = $state('');
+  let uploadFailed = $state(false);
+
+  /**
+   * Live only while this window's own upload is in flight. Named apart from the
+   * `unlisteners` inside the mount effect below, which belongs to the
+   * `preview://` channel and lives for the whole session.
+   */
+  let uploadUnlisteners: Array<() => void> = [];
+
   let deadline = 0;
   let alarm: ReturnType<typeof setTimeout> | null = null;
   let ticker: ReturnType<typeof setInterval> | null = null;
@@ -69,6 +103,7 @@
   );
 
   const fraction = $derived(Math.max(0, Math.min(1, remaining / AUTO_DISMISS_MS)));
+  const percent = $derived(total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : null);
 
   $effect(() => {
     let cancelled = false;
@@ -86,6 +121,14 @@
     // while that round trip is in flight is heard rather than raced past.
     track(onCapturePreview(show));
     track(onPreviewHidden(clear));
+    // The record gains its `url` on the Rust side and comes back on
+    // `capture://updated` — the same channel the history store adopts. Without
+    // this the copy on screen keeps `url: null` for as long as the card is up,
+    // which is exactly the window in which auto-upload finishes: Rust uploads
+    // the capture the instant it lands, and the card that is on screen for it
+    // would show nothing at all, because the Upload button is suppressed under
+    // auto-upload and the "Uploaded" branch tests a field that never changed.
+    track(onCaptureUpdated(adopt));
 
     // Rust emits `preview://show` once, just before it shows the window, and on
     // the first capture this webview is still loading when that emit goes out.
@@ -108,6 +151,7 @@
       for (const unlisten of unlisteners) unlisten();
       clearTimeout(orphan);
       stopCountdown();
+      stopWatchingUpload();
     };
   });
 
@@ -121,7 +165,11 @@
   function show(next: CaptureRecord): void {
     generation += 1;
     thumbBroken = false;
+    // A new capture is a different record: an upload started for the last one
+    // keeps running in Rust, but this card stops claiming to be about it.
+    resetUpload();
     record = next;
+    void refreshDestination();
     // A second capture replaces the content and restarts the clock rather than
     // opening another window — but not while the pointer is resting on the card.
     if (hovering) {
@@ -130,6 +178,23 @@
     } else {
       startCountdown();
     }
+  }
+
+  /**
+   * An existing record changed in place: an upload gave it a `url`, or the
+   * editor saved over it. Deliberately *not* a `show()` — the capture on screen
+   * is the same one, so the countdown, the hover hold and any upload state
+   * belong to it and must survive. Only the record is swapped, which is enough
+   * for the thumbnail (versioned on `sizeBytes`) and the uploaded state to
+   * follow.
+   *
+   * An update for some other capture is ignored: `capture://updated` is emitted
+   * to every window, and a History upload of a month-old shot must not repaint
+   * the card describing the capture that just happened.
+   */
+  function adopt(next: CaptureRecord): void {
+    if (record?.id !== next.id) return;
+    record = next;
   }
 
   /**
@@ -144,8 +209,104 @@
   function clear(): void {
     generation += 1;
     stopCountdown();
+    resetUpload();
     record = null;
     hovering = false;
+  }
+
+  function stopWatchingUpload(): void {
+    for (const off of uploadUnlisteners) off();
+    uploadUnlisteners = [];
+  }
+
+  function resetUpload(): void {
+    stopWatchingUpload();
+    uploading = false;
+    uploadFailed = false;
+    uploadNote = '';
+    sent = 0;
+    total = 0;
+  }
+
+  /**
+   * Whether an upload can actually succeed right now. A failure here means no
+   * button, not a broken one — the affordance appears only when M3 §6's "a
+   * destination is configured" is genuinely true.
+   */
+  async function refreshDestination(): Promise<void> {
+    try {
+      destReady = canUploadNow(await destinationStatus());
+    } catch {
+      destReady = false;
+    }
+  }
+
+  /**
+   * Upload the capture that is on screen, because the user pressed the button
+   * on it. Nothing here fires on show, on hover, or on the countdown expiring.
+   *
+   * The countdown stops for the duration: a card that vanishes mid-transfer
+   * takes its Cancel with it.
+   */
+  async function upload(): Promise<void> {
+    const current = record;
+    if (!current || uploading) return;
+    const id = current.id;
+
+    stopCountdown();
+    uploading = true;
+    uploadFailed = false;
+    uploadNote = '';
+    sent = 0;
+    total = 0;
+
+    // Set from `upload://error`: a cancel rejects the command like any other
+    // failure, and the flag is the only honest way to tell them apart.
+    let cancelled = false;
+
+    const finish = (failed: boolean, note: string) => {
+      // A capture that landed while this was in flight already reset the card;
+      // its state must not be overwritten by the previous one's outcome.
+      if (record?.id !== id) return;
+      stopWatchingUpload();
+      uploading = false;
+      uploadFailed = failed;
+      uploadNote = note;
+      // The result gets its own full countdown, so it is on screen long enough
+      // to read rather than inheriting whatever was left of the first one.
+      if (!hovering) startCountdown();
+    };
+
+    try {
+      uploadUnlisteners = await Promise.all([
+        onUploadProgress((p) => {
+          if (p.id !== id) return;
+          sent = p.sent;
+          total = p.total;
+        }),
+        onUploadError((e) => {
+          if (e.id !== id) return;
+          cancelled = e.cancelled;
+        })
+      ]);
+      await uploadCapture(id);
+      finish(
+        false,
+        settings.current?.copyUrlAfterUpload === false ? 'Uploaded' : 'Uploaded — link copied'
+      );
+    } catch (err) {
+      // A cancel is not a failure, so it is not painted as one.
+      if (cancelled) finish(false, 'Upload cancelled');
+      else finish(true, errorMessage(err));
+    }
+  }
+
+  async function abortUpload(): Promise<void> {
+    const current = record;
+    if (!current) return;
+    // Infallible on the Rust side and a no-op when nothing is running; the
+    // outcome still lands through `upload()`'s own await.
+    await cancelUpload(current.id);
   }
 
   function startCountdown(): void {
@@ -173,7 +334,9 @@
 
   function release(): void {
     hovering = false;
-    if (record) startCountdown();
+    // Never while an upload is running: the countdown would take the Cancel off
+    // screen part-way through the transfer it belongs to.
+    if (record && !uploading) startCountdown();
   }
 
   async function dismiss(): Promise<void> {
@@ -192,6 +355,7 @@
     // Cleared only once the window is actually gone, so a Rust `show` that
     // races this cannot reveal an emptied card.
     if (hidden && gen === generation) {
+      resetUpload();
       record = null;
       hovering = false;
     }
@@ -253,6 +417,47 @@
         <span class="dims">{record.width}&times;{record.height}</span>
       </span>
     </button>
+
+    <!-- The upload affordance, where the user is already looking after a capture
+         (M3 §6). It appears **only** when the configured destination is ready,
+         and it uploads only when pressed — the preview never sends anything on
+         its own, whatever the countdown does. Outside `.card` because that is a
+         <button> and a button cannot contain one. -->
+    {#if uploading}
+      <div class="uprow">
+        <div class="track" aria-hidden="true">
+          <div
+            class="ubar"
+            class:indeterminate={percent === null}
+            style={percent === null ? undefined : `width: ${percent}%`}
+          ></div>
+        </div>
+        <span class="ustatus num" role="status">
+          {percent === null ? 'Uploading…' : `${percent}%`}
+        </span>
+        <button type="button" class="ubtn" onclick={() => void abortUpload()}>Cancel</button>
+      </div>
+    {:else if uploadNote}
+      <div class="uprow">
+        <span class="ustatus" class:bad={uploadFailed} role="status" title={uploadNote}>
+          {uploadNote}
+        </span>
+      </div>
+      <!-- Not offered while auto-upload is on: Rust already sent this capture
+           through `auto_upload_if_enabled`, and a button here would upload the
+           same picture a second time. -->
+    {:else if destReady && !record.url && settings.current?.autoUpload !== true}
+      <div class="uprow">
+        <button type="button" class="ubtn accent" onclick={() => void upload()}>
+          <Icon name="upload" size={12} />
+          Upload
+        </button>
+      </div>
+    {:else if record.url}
+      <div class="uprow">
+        <span class="ustatus" title={record.url}>Uploaded</span>
+      </div>
+    {/if}
 
     <button type="button" class="close" aria-label="Dismiss preview" onclick={dismiss}>
       <Icon name="x" size={12} />
@@ -367,6 +572,109 @@
     color: var(--text-faint);
   }
 
+  /* One 22px strip under the metadata line. The window is 300×200, so this is
+     the whole budget: the picture gives up the height, nothing else moves. */
+  .uprow {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+    height: 22px;
+    margin-top: 6px;
+    min-width: 0;
+  }
+
+  .track {
+    flex: 1;
+    min-width: 0;
+    height: 3px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--border);
+  }
+
+  .ubar {
+    height: 100%;
+    width: 0;
+    border-radius: 999px;
+    background: var(--accent);
+    transition: width 160ms linear;
+  }
+
+  /* No known total: a sliding sliver rather than a percentage nobody reported. */
+  .ubar.indeterminate {
+    width: 35%;
+    animation: uslide 1.1s ease-in-out infinite;
+  }
+
+  @keyframes uslide {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(290%);
+    }
+  }
+
+  .ustatus {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .ustatus.bad {
+    color: var(--danger);
+  }
+
+  .ustatus.num {
+    flex: none;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .ubtn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: none;
+    height: 22px;
+    padding: 0 8px;
+    font: inherit;
+    font-size: 11px;
+    color: var(--text);
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition:
+      color 120ms ease,
+      background-color 120ms ease,
+      border-color 120ms ease;
+  }
+
+  .ubtn:hover {
+    border-color: var(--border-strong);
+  }
+
+  .ubtn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .ubtn.accent {
+    color: var(--accent-text);
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .ubtn.accent:hover {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+  }
+
   .close {
     position: absolute;
     top: 6px;
@@ -427,8 +735,15 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .bar {
+    .bar,
+    .ubar {
       transition: none;
+    }
+
+    .ubar.indeterminate {
+      width: 100%;
+      animation: none;
+      opacity: 0.5;
     }
   }
 </style>

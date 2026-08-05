@@ -1,14 +1,21 @@
 <script lang="ts">
   import { ask } from '@tauri-apps/plugin-dialog';
   import {
+    cancelUpload,
     copyCapture,
+    errorMessage,
+    onUploadError,
+    onUploadProgress,
     openCapture,
     openEditor,
     revealCapture,
+    uploadCapture,
     versionedAssetUrl,
     type CaptureRecord
   } from '$lib/api';
+  import { writeClipboardText } from '$lib/clipboard';
   import { history } from '$lib/stores/history.svelte';
+  import { settings } from '$lib/stores/settings.svelte';
   import OcrPanel from '$lib/components/OcrPanel.svelte';
   import { toast } from '$lib/components/Toast.svelte';
 
@@ -23,7 +30,42 @@
   let thumbBroken = $state(false);
   let ocrOpen = $state(false);
 
+  let uploading = $state(false);
+  let sent = $state(0);
+  let total = $state(0);
+
+  /**
+   * Live only while this card's own upload is in flight.
+   *
+   * History renders one card per record — 82 of them here — so subscribing on
+   * mount would mean hundreds of standing listeners for events almost none of
+   * them will ever hear. They go up before `upload_capture` is called and come
+   * down when it ends, which is also what makes the id filter cheap rather than
+   * a hot path.
+   */
+  let unlisteners: Array<() => void> = [];
+
+  /**
+   * Set from `upload://error`, which is the authority on it. A cancel rejects
+   * `upload_capture` like any other failure, and the only honest way to tell
+   * the two apart is this flag — Rust is explicit that the message must not be
+   * matched on.
+   */
+  let cancelled = false;
+
   const hasFile = $derived(record.saved && record.path !== '');
+
+  /**
+   * A destination is *selected*. Not the same as it being ready — a missing
+   * credential surfaces as the upload's own error, which names what to fix,
+   * where a disabled button with no explanation would not.
+   *
+   * `?? 'none'` matters: a `settings.json` written before M3 has no
+   * `destination` at all, and an absent field must read as "nowhere to send",
+   * never as "somewhere".
+   */
+  const canUpload = $derived((settings.current?.destination ?? 'none') !== 'none');
+  const percent = $derived(total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : null);
   // Versioned: an edit saved over its original keeps the same thumbnail path,
   // and an unchanged `src` is never re-fetched (see `versionedAssetUrl`).
   const thumbSrc = $derived(
@@ -38,6 +80,11 @@
     thumbBroken = false;
     ocrOpen = false;
   });
+
+  // A card destroyed mid-upload — the list re-sorted, the view navigated away —
+  // must not leave three listeners behind holding a closure over a dead record.
+  // The upload itself keeps running; it is Rust's, not this component's.
+  $effect(() => stopWatching);
 
   function relativeTime(ms: number): string {
     const diff = Date.now() - ms;
@@ -101,6 +148,93 @@
     }
   }
 
+  function stopWatching() {
+    for (const off of unlisteners) off();
+    unlisteners = [];
+  }
+
+  function endUpload() {
+    uploading = false;
+    sent = 0;
+    total = 0;
+    stopWatching();
+  }
+
+  /**
+   * The one action in this card that puts the capture on the network, and it
+   * only ever happens because the user pressed this button.
+   *
+   * The listeners go up *before* the command: `upload_capture` is outstanding
+   * for the whole transfer, so a subscription made after the await would never
+   * be made at all.
+   *
+   * The record's own `url` arrives on `capture://updated`, which the history
+   * store adopts, so the resolved record is not needed here.
+   */
+  async function doUpload(event: MouseEvent) {
+    event.stopPropagation();
+    if (uploading) return;
+    const id = record.id;
+
+    uploading = true;
+    cancelled = false;
+    sent = 0;
+    total = 0;
+    try {
+      unlisteners = await Promise.all([
+        onUploadProgress((p) => {
+          if (p.id !== id) return;
+          sent = p.sent;
+          total = p.total;
+        }),
+        onUploadError((e) => {
+          if (e.id !== id) return;
+          cancelled = e.cancelled;
+        })
+      ]);
+      await uploadCapture(id);
+      endUpload();
+      toast.success('Uploaded');
+    } catch (err) {
+      const stopped = cancelled;
+      endUpload();
+      // A cancel is not a failure — the user asked for it, and a red toast for
+      // getting what you asked for is a bug.
+      if (stopped) toast.info('Upload cancelled');
+      // Verbatim otherwise: it is the only thing that says whether to retry,
+      // fix a credential, or wait out a rate limit.
+      else toast.error(errorMessage(err));
+    }
+  }
+
+  /**
+   * A real stop, not a UI reset: Rust fails the payload read mid-chunk, so the
+   * request ends on the wire. The card stays in its uploading state until
+   * `upload_capture` returns, so a cancel that races the final byte still tells
+   * the truth about which one won.
+   */
+  async function doCancelUpload(event: MouseEvent) {
+    event.stopPropagation();
+    await cancelUpload(record.id);
+  }
+
+  /**
+   * Through `writeClipboardText`, not `navigator.clipboard` directly: the async
+   * Clipboard API rejects when the document does not have focus, and a card in
+   * a window that just lost focus is exactly where this button gets pressed.
+   */
+  async function doCopyLink(event: MouseEvent) {
+    event.stopPropagation();
+    const url = record.url;
+    if (!url) return;
+    try {
+      await writeClipboardText(url);
+      toast.success('Link copied');
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  }
+
   // No round trip of its own: the panel runs `ocr_capture` itself, so it can own
   // the working state instead of the card holding a spinner it cannot explain.
   function doExtractText(event: MouseEvent) {
@@ -128,6 +262,7 @@
 
 <div
   class="card"
+  class:uploading
   role="button"
   tabindex="0"
   aria-label="Open {record.name}"
@@ -254,6 +389,86 @@
         </svg>
       </button>
 
+      <!-- Uploading is opt-in per capture (M3 §1): this button is the only way
+           a capture in History leaves the machine, and while one is in flight it
+           becomes the Cancel for that same upload rather than sitting beside it. -->
+      {#if uploading}
+        <button
+          type="button"
+          class="act"
+          title="Cancel upload"
+          aria-label="Cancel uploading {record.name}"
+          onclick={doCancelUpload}
+        >
+          <svg
+            viewBox="0 0 16 16"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="4.75" y="4.75" width="6.5" height="6.5" rx="1.5" />
+          </svg>
+        </button>
+      {:else}
+        <button
+          type="button"
+          class="act"
+          title={!hasFile
+            ? 'That capture was not saved to disk, so there is no file to upload.'
+            : canUpload
+              ? 'Upload to the configured destination'
+              : 'No upload destination is configured. Settings › Destinations.'}
+          aria-label="Upload {record.name}"
+          disabled={!hasFile || !canUpload}
+          onclick={doUpload}
+        >
+          <svg
+            viewBox="0 0 16 16"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M8 2.75v7.5" />
+            <path d="m5 5.75 3-3 3 3" />
+            <path d="M2.75 11.25v1a1.5 1.5 0 0 0 1.5 1.5h7.5a1.5 1.5 0 0 0 1.5-1.5v-1" />
+          </svg>
+        </button>
+      {/if}
+
+      {#if record.url}
+        <button
+          type="button"
+          class="act"
+          title="Copy link"
+          aria-label="Copy the link to {record.name}"
+          onclick={doCopyLink}
+        >
+          <svg
+            viewBox="0 0 16 16"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M6.75 9.25a2.5 2.5 0 0 0 3.54 0l1.96-1.96a2.5 2.5 0 0 0-3.54-3.54l-.9.9" />
+            <path d="M9.25 6.75a2.5 2.5 0 0 0-3.54 0L3.75 8.71a2.5 2.5 0 0 0 3.54 3.54l.9-.9" />
+          </svg>
+        </button>
+      {/if}
+
       <!-- OCR reads the PNG off disk, so this is dead without one, exactly like
            the four actions above it. -->
       <button
@@ -311,6 +526,28 @@
 
     {#if !record.saved}
       <span class="badge" title="This capture was not written to disk">Not saved</span>
+    {/if}
+
+    {#if record.url && !uploading}
+      <span class="badge badge-right" title={record.url}>Uploaded</span>
+    {/if}
+
+    <!-- A 20 MB capture on slow upstream is tens of seconds of nothing without
+         this. The bar is indeterminate when the destination streams without a
+         known length, which is a real state rather than 0%. -->
+    {#if uploading}
+      <div class="progress" role="status" aria-label="Uploading {record.name}">
+        <div class="track">
+          <div
+            class="bar"
+            class:indeterminate={percent === null}
+            style={percent === null ? undefined : `width: ${percent}%`}
+          ></div>
+        </div>
+        <span class="progress-text num">
+          {percent === null ? 'Uploading…' : `${percent}%`}
+        </span>
+      </div>
     {/if}
   </div>
 
@@ -397,9 +634,81 @@
     backdrop-filter: var(--blur);
   }
 
+  .badge-right {
+    left: auto;
+    right: 8px;
+    color: var(--success);
+    border-color: color-mix(in srgb, var(--success) 45%, transparent);
+  }
+
+  /* Pinned to the bottom edge; the action row lifts clear of it below, so the
+     bar never covers the Cancel button it belongs to. */
+  .progress {
+    position: absolute;
+    inset: auto 0 0 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: var(--blur);
+  }
+
+  .track {
+    flex: 1;
+    min-width: 0;
+    height: 3px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--border);
+  }
+
+  .bar {
+    height: 100%;
+    width: 0;
+    border-radius: 999px;
+    background: var(--accent);
+    transition: width 160ms linear;
+  }
+
+  /* No known total: a sliding sliver says "working" without claiming a
+     percentage the destination never reported. */
+  .bar.indeterminate {
+    width: 35%;
+    animation: slide 1.1s ease-in-out infinite;
+  }
+
+  @keyframes slide {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(290%);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bar {
+      transition: none;
+    }
+
+    .bar.indeterminate {
+      width: 100%;
+      animation: none;
+      opacity: 0.5;
+    }
+  }
+
+  .progress-text {
+    flex: none;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
   .actions {
     position: absolute;
     inset: auto 0 0 0;
+    z-index: 2;
     display: flex;
     gap: 4px;
     padding: 8px;
@@ -414,8 +723,16 @@
   }
 
   .card:hover .actions,
-  .card:focus-within .actions {
+  .card:focus-within .actions,
+  /* An upload in flight must keep its Cancel reachable without hovering —
+     a cancel you have to find is not a cancel. */
+  .card.uploading .actions {
     opacity: 1;
+  }
+
+  /* Room for the progress strip pinned below it. */
+  .card.uploading .actions {
+    padding-bottom: 36px;
   }
 
   .act {

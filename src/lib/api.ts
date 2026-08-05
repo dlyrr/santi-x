@@ -12,6 +12,8 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import type {
   ArmPayload,
   CaptureRecord,
+  DestinationKind,
+  DestinationStatus,
   FreezeInfo,
   HotkeyStatus,
   MonitorInfo,
@@ -20,6 +22,9 @@ import type {
   ScrollOutcome,
   ScrollProgress,
   Settings,
+  UploadDone,
+  UploadError,
+  UploadProgress,
   WindowInfo
 } from '$lib/types';
 
@@ -32,7 +37,13 @@ export type {
   ArmPayload,
   CaptureKind,
   CaptureRecord,
+  CustomUploaderSettings,
+  DestinationChoice,
+  DestinationKind,
+  DestinationStatus,
   FreezeInfo,
+  FtpSecurity,
+  FtpSettings,
   HotkeyMechanism,
   Hotkeys,
   HotkeyStatus,
@@ -43,13 +54,26 @@ export type {
   ScrollOutcome,
   ScrollProgress,
   ScrollStopReason,
+  SecretStatus,
   Settings,
   Theme,
+  UploadDone,
+  UploadError,
+  UploadProgress,
   View,
   WindowInfo,
   WindowRect
 } from '$lib/types';
 export {
+  canUploadNow,
+  DESTINATION_KINDS,
+  DESTINATION_LABEL,
+  EMPTY_CUSTOM_UPLOADER,
+  FTP_DEFAULTS,
+  FTP_SECURITY,
+  ftpSecurityOf,
+  IMGUR_REGISTER_URL,
+  isDestinationKind,
   isScrollStopReason,
   SCROLL_DELAY_MS,
   SCROLL_MAX_FRAMES,
@@ -368,6 +392,153 @@ export async function getPreviewRecord(): Promise<CaptureRecord | null> {
   return invoke<CaptureRecord | null>('get_preview_record');
 }
 
+/* ------------------------------------------------------------- destinations */
+
+/**
+ * All three destinations, in a fixed order: which is active, whether each is
+ * configured, and which of its credentials exist (M3 §6).
+ *
+ * **Booleans only.** No command anywhere returns a stored secret — `secrets::get`
+ * is `pub(in crate::upload)`, so a `#[tauri::command]` cannot even reach one —
+ * and no UI may be written that expects one (M3 §2).
+ *
+ * Call it again after anything that could change the answer: a secret written
+ * or cleared, a `.sxcu` imported, a settings save that moves the active
+ * destination. It is a cheap read of the credential store, not a network call.
+ */
+export async function destinationStatus(): Promise<DestinationStatus[]> {
+  return invoke<DestinationStatus[]>('destination_status');
+}
+
+/**
+ * Write a credential into Windows Credential Manager under
+ * `santi.sharex/<kind>` (M3 §2). One-way: nothing reads it back out to here.
+ *
+ * `field` is a `SecretStatus.field` from `destinationStatus()` — never a name
+ * typed out here. Rust owns that list, because a custom uploader's slots are
+ * whichever headers its `.sxcu` declared.
+ *
+ * A blank `value` **clears** the credential rather than storing an empty one:
+ * that is what emptying the field means, and an empty stored secret would show
+ * as configured and then fail at upload. Rust also trims, because a key pasted
+ * out of a web page usually arrives with a newline on it.
+ *
+ * The `value` exists in this process only for the length of this call. Do not
+ * keep it in a `$state`, a draft, or anything that survives the await: clear the
+ * input the moment this resolves.
+ */
+export async function setDestinationSecret(
+  kind: DestinationKind,
+  field: string,
+  value: string
+): Promise<void> {
+  await invoke<void>('set_destination_secret', { kind, field, value });
+}
+
+/** Removes the credential entirely. Succeeds when there was none to remove. */
+export async function clearDestinationSecret(
+  kind: DestinationKind,
+  field: string
+): Promise<void> {
+  await invoke<void>('clear_destination_secret', { kind, field });
+}
+
+/**
+ * Check a destination's setup without uploading a capture. Resolves with one
+ * sentence for the user — **show it verbatim**, because how much was actually
+ * verified differs per destination and the sentence is what says so:
+ *
+ * - `ftp` really connects, logs in and looks at the remote directory, and
+ *   creates nothing. This is the only one that is networked, so it can take as
+ *   long as a connect timeout.
+ * - `imgur` checks a Client ID is saved and can go in a request header. It does
+ *   **not** ask Imgur: the only request Imgur offers uploads a picture, and a
+ *   test must leave nothing behind (M3 §6).
+ * - `custom` re-validates the imported `.sxcu` and that every credential header
+ *   has a value stored. It does **not** contact the server, for the same reason.
+ *
+ * Do not paraphrase any of them into "Connected" — a test that says it verified
+ * something it never asked about is worse than no test.
+ *
+ * A rejection carries the **real** error — the FTP server's own refusal, the
+ * missing credential, the DNS failure. Show it as it arrives: "Test failed"
+ * tells the user nothing they can act on, and Rust has already guaranteed the
+ * text contains no credential (M3 §2).
+ */
+export async function testDestination(kind: DestinationKind): Promise<string> {
+  return invoke<string>('test_destination', { kind });
+}
+
+/**
+ * Validate the text of a ShareX `.sxcu` against the supported subset (M3 §4)
+ * and store it as `Settings.customUploader`. Resolves with the whole `Settings`
+ * as saved; Rust also emits `settings://changed`, so the store adopts it either
+ * way and the caller rarely needs the return value.
+ *
+ * Takes the file's **contents**, not a path — there is no filesystem plugin in
+ * this app, so the webview reads the file it was handed (a plain
+ * `<input type="file">`) and passes the text across. `custom::import` is what
+ * splits out the credential-looking headers, into a type that is deliberately
+ * not `Serialize`, so nothing comes back the other way.
+ *
+ * A file needing something unsupported — OAuth, `RegexList`, a `RequestBodyType`
+ * outside the two, a destination that is not an image uploader — is **rejected
+ * here** rather than accepted and mysteriously broken at upload time. Every
+ * rejection names the offending field; surface it verbatim.
+ *
+ * Importing does not switch the active destination: choosing where captures go
+ * is the user's decision, and picking a file is not that decision (M3 §1).
+ *
+ * There is no matching "forget it" command, and none is needed. Clear each
+ * `SecretStatus.field` from `destinationStatus()` with
+ * `clearDestinationSecret('custom', …)`, **then** save
+ * `customUploader: EMPTY_CUSTOM_UPLOADER`. That order matters: the config is
+ * what names the credentials, so dropping it first would orphan them in
+ * Credential Manager with nothing left to find them by.
+ */
+export async function importCustomUploader(contents: string): Promise<Settings> {
+  return invoke<Settings>('import_custom_uploader', { contents });
+}
+
+/* ------------------------------------------------------------------ upload */
+
+/**
+ * Send one capture to the active destination, and resolve with the record as it
+ * is *after* the upload — `url` and `deletionUrl` filled in (M3 §6).
+ *
+ * **This is the only thing in `src/` that puts a capture on the network.** The
+ * one other caller is Rust's own `auto_upload_if_enabled`, behind
+ * `Settings.autoUpload`. Nothing calls this speculatively, on hover, or on
+ * mount.
+ *
+ * The transfer runs on a `spawn_blocking` worker, so awaiting it does not wedge
+ * the app — but it does mean the promise is outstanding for the whole upload.
+ * Subscribe to `onUploadProgress` **before** calling, or the bar has nothing to
+ * move; `capture://updated` carries the same record to the history store, so a
+ * view backed by that store needs nothing from the return value.
+ *
+ * Rejects with the real reason: no destination, a missing credential, the
+ * server's own refusal, "already uploading", or `Upload cancelled`. Read
+ * `UploadError.cancelled` from `onUploadError` rather than matching the string
+ * to tell a cancel from a failure.
+ */
+export async function uploadCapture(id: string): Promise<CaptureRecord> {
+  return invoke<CaptureRecord>('upload_capture', { id });
+}
+
+/**
+ * Ask the upload in flight for `id` to stop, and mean it: the payload reader
+ * checks the flag on every chunk, so the HTTP body or the FTP data connection
+ * ends mid-flight rather than the result being quietly discarded.
+ *
+ * Infallible, and a no-op when that capture is not uploading — the UI is often a
+ * moment behind a transfer that just finished, and that is not an error. The
+ * outcome still arrives on `upload://error` with `cancelled: true`.
+ */
+export async function cancelUpload(id: string): Promise<void> {
+  await invoke<void>('cancel_upload', { id });
+}
+
 /* ------------------------------------------------------------------ events */
 
 export function onCaptureNew(cb: (record: CaptureRecord) => void): Promise<UnlistenFn> {
@@ -476,6 +647,44 @@ export function onSettingsChanged(cb: (settings: Settings) => void): Promise<Unl
  */
 export function onHotkeyStatus(cb: (statuses: HotkeyStatus[]) => void): Promise<UnlistenFn> {
   return listen<HotkeyStatus[]>('hotkeys://status', (e) => cb(e.payload));
+}
+
+/**
+ * Bytes sent for one upload (M3 §6). Emitted to every window, so the capture
+ * preview hears progress for an upload the history view started and the other
+ * way round — always filter on `payload.id` before touching local state.
+ *
+ * `total` is `0` when the destination streams without a known length; that is
+ * an indeterminate upload, not a zero-byte one.
+ */
+export function onUploadProgress(cb: (progress: UploadProgress) => void): Promise<UnlistenFn> {
+  return listen<UploadProgress>('upload://progress', (e) => cb(e.payload));
+}
+
+/**
+ * An upload finished and the destination returned `url`. The record itself gains
+ * its `url` on the Rust side and arrives separately on `capture://updated`, so
+ * a view backed by the history store does not have to patch anything from here.
+ *
+ * The clipboard write, when `Settings.copyUrlAfterUpload` is on, has already
+ * happened in Rust — do not do it again from the UI.
+ */
+export function onUploadDone(cb: (done: UploadDone) => void): Promise<UnlistenFn> {
+  return listen<UploadDone>('upload://done', (e) => cb(e.payload));
+}
+
+/**
+ * An upload failed, or was cancelled — one event for both, told apart by
+ * `payload.cancelled` and never by matching the message.
+ *
+ * `message` is a finished sentence, shown as it arrives: it is the only thing
+ * that says whether to retry, fix a credential, or wait out a rate limit, and
+ * Rust guarantees no credential is ever interpolated into it (M3 §2). A
+ * cancelled upload is not a failure — take the progress row down without
+ * raising a red toast for something the user just asked for.
+ */
+export function onUploadError(cb: (error: UploadError) => void): Promise<UnlistenFn> {
+  return listen<UploadError>('upload://error', (e) => cb(e.payload));
 }
 
 export type { UnlistenFn };

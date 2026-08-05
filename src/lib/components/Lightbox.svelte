@@ -1,14 +1,21 @@
 <script lang="ts">
   import { ask } from '@tauri-apps/plugin-dialog';
   import {
+    cancelUpload,
     copyCapture,
+    errorMessage,
+    onUploadError,
+    onUploadProgress,
     openCapture,
     openEditor,
     revealCapture,
+    uploadCapture,
     versionedAssetUrl,
     type CaptureRecord
   } from '$lib/api';
+  import { writeClipboardText } from '$lib/clipboard';
   import { history } from '$lib/stores/history.svelte';
+  import { settings } from '$lib/stores/settings.svelte';
   import OcrPanel from '$lib/components/OcrPanel.svelte';
   import { toast } from '$lib/components/Toast.svelte';
 
@@ -26,8 +33,36 @@
   let imgBroken = $state(false);
   let ocrOpen = $state(false);
 
+  /**
+   * The capture whose upload is in flight, by id rather than a boolean: the
+   * lightbox navigates between records while one is uploading, and the progress
+   * shown must belong to the picture on screen, not to whichever one was on
+   * screen when the transfer began.
+   */
+  let uploadingId = $state<string | null>(null);
+  let sent = $state(0);
+  let total = $state(0);
+  let unlisteners: Array<() => void> = [];
+
+  /**
+   * Set from `upload://error`, the authority on it: a cancel rejects
+   * `upload_capture` like any other failure, and the flag is the only honest
+   * way to tell them apart.
+   */
+  let cancelled = false;
+
   const record = $derived(records[index] ?? records[records.length - 1] ?? null);
   const hasFile = $derived(!!record && record.saved && record.path !== '');
+
+  const uploading = $derived(!!record && uploadingId === record.id);
+  const percent = $derived(total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : null);
+
+  /**
+   * A destination is *selected*. Readiness is not checked here: a missing
+   * credential comes back as the upload's own error, which names what to fix.
+   * `?? 'none'` so a pre-M3 `settings.json` reads as "nowhere to send".
+   */
+  const canUpload = $derived((settings.current?.destination ?? 'none') !== 'none');
   // Versioned: an edit saved over its original keeps the same path, and an
   // unchanged `src` is never re-fetched (see `versionedAssetUrl`).
   const fullSrc = $derived(record ? versionedAssetUrl(record.path, record.sizeBytes) : '');
@@ -56,6 +91,10 @@
     dialogEl?.focus();
     return () => previous?.focus?.();
   });
+
+  // Closing the lightbox does not cancel the upload — Rust owns it and it keeps
+  // going — but it must not leave listeners behind holding this dialog's state.
+  $effect(() => stopWatching);
 
   function formatBytes(n: number): string {
     if (n < 1024) return `${n} B`;
@@ -160,6 +199,77 @@
       await revealCapture(record.id);
     } catch (err) {
       toast.error(String(err));
+    }
+  }
+
+  function stopWatching() {
+    for (const off of unlisteners) off();
+    unlisteners = [];
+  }
+
+  function endUpload() {
+    uploadingId = null;
+    sent = 0;
+    total = 0;
+    stopWatching();
+  }
+
+  /**
+   * The only thing in this dialog that puts the capture on the network, and it
+   * happens because this button was pressed — never on open, never on navigate.
+   *
+   * Listeners go up before the command: `upload_capture` stays outstanding for
+   * the whole transfer, so a subscription made after the await would never be
+   * made at all. The record's `url` arrives on `capture://updated`, which the
+   * history store adopts, and `records` re-renders with the link action.
+   */
+  async function doUpload() {
+    if (!record || uploadingId) return;
+    const id = record.id;
+
+    uploadingId = id;
+    cancelled = false;
+    sent = 0;
+    total = 0;
+    try {
+      unlisteners = await Promise.all([
+        onUploadProgress((p) => {
+          if (p.id !== id) return;
+          sent = p.sent;
+          total = p.total;
+        }),
+        onUploadError((e) => {
+          if (e.id !== id) return;
+          cancelled = e.cancelled;
+        })
+      ]);
+      await uploadCapture(id);
+      endUpload();
+      toast.success('Uploaded');
+    } catch (err) {
+      const stopped = cancelled;
+      endUpload();
+      // Getting exactly what you asked for is not an error.
+      if (stopped) toast.info('Upload cancelled');
+      else toast.error(errorMessage(err));
+    }
+  }
+
+  /** A real stop on the Rust side; the state clears when the command returns. */
+  async function doCancelUpload() {
+    if (!uploadingId) return;
+    await cancelUpload(uploadingId);
+  }
+
+  /** See `CaptureCard.doCopyLink` for why this is not `navigator.clipboard`. */
+  async function doCopyLink() {
+    const url = record?.url;
+    if (!url) return;
+    try {
+      await writeClipboardText(url);
+      toast.success('Link copied');
+    } catch (err) {
+      toast.error(errorMessage(err));
     }
   }
 
@@ -305,6 +415,23 @@
         {/if}
       </div>
 
+      {#if uploading}
+        <!-- Between the picture and the buttons, where the eye already is: a
+             20 MB capture on slow upstream is otherwise a frozen dialog. -->
+        <div class="upload-bar" role="status">
+          <div class="track">
+            <div
+              class="bar"
+              class:indeterminate={percent === null}
+              style={percent === null ? undefined : `width: ${percent}%`}
+            ></div>
+          </div>
+          <span class="upload-text num">
+            {percent === null ? 'Uploading…' : `Uploading — ${percent}%`}
+          </span>
+        </div>
+      {/if}
+
       <footer class="foot">
         <span class="counter num">{index + 1} of {records.length}</span>
         <div class="tools">
@@ -325,6 +452,38 @@
           >
             Extract text
           </button>
+
+          <!-- Opt-in per capture (M3 §1): pressing this is the only reason a
+               capture opened here ever leaves the machine. -->
+          {#if uploading}
+            <button type="button" class="btn" onclick={doCancelUpload}>Cancel upload</button>
+          {:else}
+            <button
+              type="button"
+              class="btn"
+              disabled={!hasFile || !canUpload || uploadingId !== null}
+              title={!hasFile
+                ? 'This capture was not saved to disk, so there is no file to upload.'
+                : canUpload
+                  ? 'Send this capture to the configured destination'
+                  : 'No upload destination is configured. Settings › Destinations.'}
+              onclick={doUpload}
+            >
+              Upload
+            </button>
+          {/if}
+
+          {#if record.url}
+            <button
+              type="button"
+              class="btn"
+              title={record.url}
+              onclick={doCopyLink}
+            >
+              Copy link
+            </button>
+          {/if}
+
           <button type="button" class="btn btn-danger" onclick={doDelete}>Delete</button>
         </div>
       </footer>
@@ -498,6 +657,66 @@
 
   .next {
     right: 12px;
+  }
+
+  .upload-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-inset);
+  }
+
+  .track {
+    flex: 1;
+    min-width: 0;
+    height: 4px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: var(--border);
+  }
+
+  .bar {
+    height: 100%;
+    width: 0;
+    border-radius: 999px;
+    background: var(--accent);
+    transition: width 160ms linear;
+  }
+
+  /* No known total: a sliding sliver says "working" rather than claiming a
+     percentage the destination never reported. */
+  .bar.indeterminate {
+    width: 30%;
+    animation: slide 1.1s ease-in-out infinite;
+  }
+
+  @keyframes slide {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(340%);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bar {
+      transition: none;
+    }
+
+    .bar.indeterminate {
+      width: 100%;
+      animation: none;
+      opacity: 0.5;
+    }
+  }
+
+  .upload-text {
+    flex: none;
+    font-size: 12px;
+    color: var(--text-dim);
   }
 
   .foot {

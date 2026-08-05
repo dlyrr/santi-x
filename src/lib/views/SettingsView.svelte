@@ -2,12 +2,14 @@
   import { open as openDirectoryDialog } from '@tauri-apps/plugin-dialog';
   import { getVersion } from '@tauri-apps/api/app';
   import Toggle from '$lib/components/Toggle.svelte';
+  import DestinationsView from '$lib/views/DestinationsView.svelte';
   import { PRESETS } from '$lib/editor/ColorPicker.svelte';
   import {
     getHotkeyStatus,
     onCaptureError,
     onHotkeyStatus,
     openSaveDir,
+    DESTINATION_LABEL,
     type HotkeyMechanism,
     type HotkeyStatus,
     type Settings,
@@ -21,6 +23,21 @@
   } from '$lib/types';
   import { settings } from '$lib/stores/settings.svelte';
   import { toast } from '$lib/components/Toast.svelte';
+
+  interface Props {
+    /**
+     * Whether to render the Destinations form inline (M3 §6).
+     *
+     * On by default, because the default shell's sidebar has only three entries
+     * and Settings is the only place destinations can live there. The ShareX
+     * shell turns it off: that shell has a real Destinations menu row of its
+     * own, and the same form in two panes of one window is a second place to
+     * change the same thing rather than a convenience.
+     */
+    showDestinations?: boolean;
+  }
+
+  let { showDestinations = true }: Props = $props();
 
   type HotkeyKey = 'region' | 'fullscreen' | 'activeWindow';
 
@@ -110,6 +127,13 @@
   let version = $state('');
   let palettes = $state<Record<string, Palette>>({});
   let now = $state(Date.now());
+
+  /**
+   * Auto-upload is armed but not yet on: the toggle asked, and this is the
+   * panel that spells out what it means. The setting is *not* written until the
+   * user clicks through it, so the switch stays visibly off until then.
+   */
+  let confirmAutoUpload = $state(false);
 
   // A sample token so the filename preview looks like a real name rather than
   // re-rolling on every keystroke.
@@ -430,6 +454,28 @@
 
   function resetHotkey(key: HotkeyKey) {
     commitHotkey(key, HOTKEY_DEFAULTS[key]);
+  }
+
+  /**
+   * The one switch in this app that can send the screen off the machine without
+   * anybody asking again (M3 §1), so the toggle does not write it.
+   *
+   * Turning it *off* is immediate — there is no reason to make stopping hard.
+   * Turning it *on* only opens the confirmation below; `acceptAutoUpload` is the
+   * only thing that ever writes `true`.
+   */
+  function requestAutoUpload(next: boolean) {
+    if (!next) {
+      confirmAutoUpload = false;
+      void patch({ autoUpload: false });
+      return;
+    }
+    confirmAutoUpload = true;
+  }
+
+  async function acceptAutoUpload() {
+    confirmAutoUpload = false;
+    await patch({ autoUpload: true });
   }
 </script>
 
@@ -837,6 +883,99 @@
       </p>
     </div>
   </section>
+
+  <section class="section" aria-labelledby="sec-uploading">
+    <h2 class="section-title" id="sec-uploading">Uploading</h2>
+    <p class="section-help">
+      Uploading is opt-in, one capture at a time: the <strong>Upload</strong> action on a capture
+      is the only thing that sends it anywhere, unless you change that below.
+    </p>
+
+    <div class="row">
+      <span class="row-text">
+        <span class="row-label" id="lbl-auto-upload">Upload every capture automatically</span>
+        <span class="row-help">
+          Off, nothing leaves this machine unless you press Upload on a capture. On, every single
+          capture is sent to
+          {#if s.destination && s.destination !== 'none'}
+            <strong>{DESTINATION_LABEL[s.destination]}</strong>
+          {:else}
+            the destination you configure
+          {/if}
+          as soon as it is taken.
+        </span>
+      </span>
+      <Toggle
+        checked={s.autoUpload === true}
+        labelledBy="lbl-auto-upload"
+        onchange={requestAutoUpload}
+      />
+    </div>
+
+    <!-- Not a toggle with a shrug (M3 §1). The switch above stays off until this
+         is accepted, and the sentence that matters — hotkey captures taken while
+         you are doing something else — is stated rather than implied. -->
+    {#if confirmAutoUpload}
+      <div class="confirm" role="alertdialog" aria-labelledby="auto-upload-title">
+        <p class="confirm-title" id="auto-upload-title">
+          Send every capture to
+          {s.destination && s.destination !== 'none'
+            ? DESTINATION_LABEL[s.destination]
+            : 'the configured destination'}?
+        </p>
+        <p class="confirm-body">
+          With this on, <strong>every capture is uploaded the moment it is taken</strong> — including
+          the ones you take with a hotkey while you are working in another app, and including
+          anything that happens to be on screen at the time. You will not be asked again, per
+          capture or otherwise.
+        </p>
+        <p class="confirm-body">
+          Whatever the capture contains — a password manager, a private message, a colleague's
+          screen share — goes to
+          {#if s.destination && s.destination !== 'none'}
+            <strong>{DESTINATION_LABEL[s.destination]}</strong>
+          {:else}
+            whichever destination is configured
+          {/if}
+          along with it. Leave this off and press Upload on the captures you actually want to
+          share.
+        </p>
+        {#if !s.destination || s.destination === 'none'}
+          <p class="confirm-body">
+            No destination is configured yet, so nothing will be sent until you choose one — but
+            the moment you do, every capture starts going there.
+          </p>
+        {/if}
+        <div class="confirm-actions">
+          <button type="button" class="btn" onclick={() => (confirmAutoUpload = false)}>
+            Keep it off
+          </button>
+          <button type="button" class="btn danger" onclick={() => void acceptAutoUpload()}>
+            Upload every capture
+          </button>
+        </div>
+      </div>
+    {/if}
+
+    <div class="row">
+      <span class="row-text">
+        <span class="row-label" id="lbl-copy-url">Copy the link after uploading</span>
+        <span class="row-help">
+          Put the returned URL on the clipboard as soon as an upload finishes, so it is ready to
+          paste. The link is also kept on the capture, where History can copy it again later.
+        </span>
+      </span>
+      <Toggle
+        checked={s.copyUrlAfterUpload !== false}
+        labelledBy="lbl-copy-url"
+        onchange={(v) => patch({ copyUrlAfterUpload: v })}
+      />
+    </div>
+  </section>
+
+  {#if showDestinations}
+    <DestinationsView variant="section" />
+  {/if}
 
   <section class="section" aria-labelledby="sec-hotkeys">
     <h2 class="section-title" id="sec-hotkeys">Hotkeys</h2>
@@ -1299,6 +1438,57 @@
   .btn.subtle:hover {
     color: var(--text);
     border-color: var(--border);
+  }
+
+  .btn.danger {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 50%, transparent);
+  }
+
+  .btn.danger:hover {
+    color: var(--accent-text);
+    background: var(--danger);
+    border-color: var(--danger);
+  }
+
+  /* The auto-upload confirmation. Loud on purpose: this is the one control here
+     that can put the screen on the network without being asked again, and a
+     quiet inline note would read as a footnote to a switch that is already on. */
+  .confirm {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 4px 0 14px;
+    padding: 14px 16px;
+    color: var(--text-dim);
+    background: color-mix(in srgb, var(--danger) 8%, var(--surface));
+    border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+    border-radius: var(--radius-lg);
+  }
+
+  .confirm-title {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--danger);
+  }
+
+  .confirm-body {
+    margin: 0;
+    max-width: 62ch;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .confirm-body strong {
+    color: var(--text);
+  }
+
+  .confirm-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
   }
 
   .preview {

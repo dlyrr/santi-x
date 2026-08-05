@@ -43,6 +43,10 @@ base64 = "0.22"
 # old "Nimbus" autostart registration left behind is read and deleted through
 # the API rather than by shelling out to `reg.exe`.
 #
+# `Win32_Security_Credentials` is M3 §2: `upload/secrets.rs` keeps FTP passwords
+# and API keys in Windows Credential Manager rather than in `settings.json`, and
+# `CredWriteW`/`CredReadW`/`CredDeleteW`/`CredFree` live behind that feature.
+#
 # The WinRT namespaces at the bottom are M5 §3, the offline OCR in `ocr.rs`.
 # `Globalization` is not on that milestone's list but is unavoidable:
 # `TryCreateFromLanguage` takes a `Windows.Globalization.Language` and
@@ -53,6 +57,7 @@ base64 = "0.22"
 windows = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
+  "Win32_Security_Credentials",
   "Win32_System_Com",
   "Win32_System_DataExchange",
   "Win32_System_Memory",
@@ -67,3 +72,29 @@ windows = { version = "0.61", features = [
   "Storage_Streams",
 ] }
 tauri-plugin-autostart = "2.5.1"
+# M3 §6. `default-features = false` is load-bearing, not tidiness: reqwest's
+# default TLS backend is native-tls, which on Windows is a Schannel/OpenSSL build
+# this machine has no C toolchain for. `rustls-tls` resolves to webpki-roots plus
+# ring, both of which build here — verified, not assumed.
+#
+# `blocking` because `Destination::upload` is a synchronous trait method and every
+# upload already runs on a `spawn_blocking` worker (M3 §6, "off the UI thread");
+# reqwest's blocking client owns its own runtime thread, so it is safe to call
+# from one. `multipart` is the body Imgur and `.sxcu` MultipartFormData both need.
+# No `json` feature: `serde_json` is already a dependency and responses are parsed
+# from text, which is also what `$json:…$` templating needs to see.
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "multipart",
+  "rustls-tls",
+] }
+# M3 §5. `rustls-ring`, never `native-tls` (OpenSSL) or `rustls-aws-lc-rs`
+# (CMake). Same constraint as above, and the reason SFTP is not implemented at
+# all: an SSH stack means libssh2, which means C.
+suppaftp = { version = "10", default-features = false, features = ["rustls-ring"] }
+# The root certificates FTPS verifies against. reqwest already pulls exactly this
+# crate in behind `rustls-tls`, so naming it here costs nothing to build and means
+# HTTPS and FTPS trust the same set — an FTPS server whose certificate santi.sharex
+# rejects would be rejected by a browser too, which is the only defensible answer
+# when there is no "trust this one anyway" escape hatch (and there is not).
+webpki-roots = "1"

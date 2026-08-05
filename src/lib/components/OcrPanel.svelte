@@ -14,6 +14,7 @@
    */
   import Icon from '$lib/components/Icon.svelte';
   import { toast } from '$lib/components/Toast.svelte';
+  import { writeClipboardText } from '$lib/clipboard';
   import { errorMessage, ocrCapture, type CaptureRecord, type OcrResult } from '$lib/api';
 
   interface Props {
@@ -80,34 +81,6 @@
       failure = errorMessage(err);
       status = 'failed';
     }
-  }
-
-  /**
-   * `tauri-plugin-clipboard-manager` is a Rust dependency with no JS half
-   * installed, and `copy_capture` writes images, so text goes through the
-   * webview. Tauri serves the app from `tauri.localhost`, which WebView2 treats
-   * as a trustworthy origin, so the async API is there; the `execCommand` path
-   * is for the call being refused for want of document focus, which is the one
-   * failure mode that actually shows up.
-   */
-  async function writeClipboardText(value: string): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(value);
-      return;
-    } catch {
-      // Fall through to the synchronous path.
-    }
-    const area = document.createElement('textarea');
-    area.value = value;
-    area.setAttribute('readonly', '');
-    area.style.position = 'fixed';
-    area.style.top = '-1000px';
-    area.style.opacity = '0';
-    document.body.appendChild(area);
-    area.select();
-    const ok = document.execCommand('copy');
-    area.remove();
-    if (!ok) throw new Error('The webview refused to write to the clipboard.');
   }
 
   async function copyAll(): Promise<void> {

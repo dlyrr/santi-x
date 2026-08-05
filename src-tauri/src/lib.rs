@@ -9,6 +9,7 @@ mod overlay;
 mod preview;
 mod scroll;
 mod store;
+mod upload;
 
 use std::fs;
 use std::path::Path;
@@ -279,6 +280,12 @@ pub(crate) fn finalize(
         size_bytes,
         saved,
         copied,
+        // M3 §6. A capture has been nowhere until it is uploaded, and it is only
+        // uploaded when it is asked for — either by the Upload action or by
+        // `auto_upload_if_enabled` below, which does nothing unless the user
+        // turned auto-upload on and configured a destination.
+        url: None,
+        deletion_url: None,
     };
 
     {
@@ -289,6 +296,13 @@ pub(crate) fn finalize(
     }
 
     let _ = app.emit("capture://new", record.clone());
+
+    // M3 §1. The one implicit upload path in the app, and it is inert unless
+    // `auto_upload` is on *and* a destination is configured — neither of which
+    // is true out of the box. It hands the transfer to its own worker, so a
+    // capture never waits on the network and a failed upload never fails the
+    // capture behind it.
+    upload::auto_upload_if_enabled(app, &record);
 
     // M2.9 §3. Fire-and-forget by construction: `preview::show` hands the work
     // to its own thread, so a preview that cannot be placed or shown can never
@@ -361,6 +375,10 @@ fn save_settings(app: AppHandle, mut settings: Settings) -> Result<Settings, Str
     // Same reasoning one field down: the overlay divides by this, so a value
     // outside 2x-20x never reaches disk or the frontend (M2.9 §1).
     settings.loupe_zoom = store::normalize_loupe_zoom(settings.loupe_zoom);
+    // And one more, for the field where an unrecognised value would mean
+    // uploading somewhere this build cannot describe: anything that is not a
+    // destination santi.sharex implements becomes "none" (M3 §1).
+    settings.destination = store::normalize_destination(&settings.destination);
 
     store::persist_settings(&app, &settings)?;
     {
@@ -809,6 +827,7 @@ pub fn run() {
             app.manage(overlay::OverlayState::default());
             app.manage(preview::PreviewState::default());
             app.manage(scroll::ScrollState::default());
+            app.manage(upload::UploadState::default());
 
             // santi.sharex starts to tray, so the tray icon is the *only* way in. A
             // tray that failed to build would leave the user with no icon and
@@ -929,6 +948,17 @@ pub fn run() {
             ocr::ocr_capture,
             scroll::start_scroll_capture,
             scroll::cancel_scroll_capture,
+            // M3. Note what is *not* here: nothing that reads a secret back.
+            // `set`/`clear` write, `destination_status` answers with booleans,
+            // and `upload::secrets::get` is scoped to `crate::upload` so no
+            // command in this list could call it even by mistake.
+            upload::upload_capture,
+            upload::cancel_upload,
+            upload::test_destination,
+            upload::set_destination_secret,
+            upload::clear_destination_secret,
+            upload::destination_status,
+            upload::import_custom_uploader,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");

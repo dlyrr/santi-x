@@ -134,6 +134,37 @@ export interface Settings {
   scrollStep: number;
   /** Hard stop on the number of frames one run may capture. */
   scrollMaxFrames: number;
+  /**
+   * Where the **Upload** action sends a capture (M3 §1). `'none'` is the
+   * shipped default and the out-of-box state: nothing can leave the machine
+   * until the user picks a destination and configures it.
+   *
+   * A plain `String` on the Rust side, for the same reason `theme` is — but
+   * `normalize_destination` runs on the way in *and* on the way out, and an id
+   * this build does not know becomes `'none'` rather than some destination. So
+   * by the time one arrives here it is one of these four.
+   */
+  destination: DestinationChoice;
+  /**
+   * Upload **every** capture the moment it is taken, including hotkey captures
+   * taken while the user is doing something else (M3 §1).
+   *
+   * Defaults to **false**, with a named serde default on the Rust side so an
+   * existing `settings.json` cannot silently acquire it as `true`. The UI must
+   * not flip it on a bare toggle — see `SettingsView`'s confirmation.
+   */
+  autoUpload: boolean;
+  /** Put the returned link on the clipboard when an upload succeeds. Default true. */
+  copyUrlAfterUpload: boolean;
+  /** Non-secret FTP configuration; the password lives in Credential Manager. */
+  ftp: FtpSettings;
+  /**
+   * The imported `.sxcu`. Always present rather than nullable — an empty `name`
+   * and `requestUrl` is the "nothing imported" state, which is what Rust's
+   * `Default` writes. Any header that looked like a credential was moved to
+   * Credential Manager at import time and is only *named* here (M3 §4).
+   */
+  customUploader: CustomUploaderSettings;
   hotkeys: Hotkeys;
 }
 
@@ -170,6 +201,17 @@ export interface CaptureRecord {
   sizeBytes: number;
   saved: boolean;
   copied: boolean;
+  /**
+   * The public URL this capture was uploaded to (M3 §6), or `null` when it
+   * never was — which is every record until the user asks for one.
+   *
+   * `#[serde(default)]` on the Rust side, so the 82 records in an existing
+   * `history.json` still load; a record written before M3 arrives here with the
+   * field absent rather than null, so test it for truthiness, never for `null`.
+   */
+  url: string | null;
+  /** The destination's delete URL, when it hands one back. Same serde default. */
+  deletionUrl: string | null;
 }
 
 export interface MonitorInfo {
@@ -344,4 +386,269 @@ export interface ScrollOutcome {
   /** One finished sentence for the user, populated on success too. */
   message: string;
   incomplete: boolean;
+}
+
+/* ------------------------------------------------- upload destinations (M3) */
+
+/**
+ * The three destinations M3 ships, by the ids Rust dispatches on — mirrors
+ * `DESTINATIONS` in `store.rs` and `DestinationKind::id()` in `upload/mod.rs`.
+ *
+ * SFTP is deliberately absent: it needs an SSH stack this build has no C
+ * toolchain for, and a picker entry that always fails would be worse than
+ * saying so (M3 §5). The FTP form says it in words; nothing here may grow an
+ * `'sftp'` member that does not work.
+ */
+export const DESTINATION_KINDS = ['imgur', 'custom', 'ftp'] as const;
+
+export type DestinationKind = (typeof DESTINATION_KINDS)[number];
+
+/**
+ * `Settings.destination`. `'none'` is the shipped default and the state a fresh
+ * install stays in until the user chooses otherwise — with it, no capture can
+ * leave the machine however the other switches are set (M3 §1). Rust's
+ * `normalize_destination` turns anything it does not recognise into this rather
+ * than into some destination.
+ */
+export type DestinationChoice = DestinationKind | 'none';
+
+export function isDestinationKind(value: unknown): value is DestinationKind {
+  return typeof value === 'string' && (DESTINATION_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * Display names, matching `DestinationKind::label()` so the two sides never
+ * name the same destination differently in the same sentence. `'none'` has no
+ * Rust counterpart — it is a UI state, not a destination.
+ */
+export const DESTINATION_LABEL: Record<DestinationChoice, string> = {
+  none: 'None',
+  imgur: 'Imgur',
+  custom: 'Custom uploader',
+  ftp: 'FTP'
+};
+
+/**
+ * Where Imgur hands out a Client ID. Shown verbatim beside the field, because
+ * an empty box with no explanation reads as broken rather than as unconfigured
+ * (M3 §3) — santi.sharex embeds no client ID of its own and never will.
+ */
+export const IMGUR_REGISTER_URL = 'https://api.imgur.com/oauth2/addclient';
+
+/**
+ * How the FTP connection is secured. These are the exact strings
+ * `FtpSettings.security` holds — `FTP_SECURITY_PLAIN` / `_EXPLICIT_TLS` /
+ * `_SFTP` in `store.rs`, which `upload::ftp` matches on, case-insensitively,
+ * before it reads a password.
+ *
+ * `sftp` is listed because Rust's constant is. Nothing in this UI may ever
+ * *offer* it — SFTP is a subsystem of SSH and shares no code with FTPS, and
+ * santi.sharex carries no SSH stack (M3 §5) — but a hand-edited `settings.json`
+ * can name it, and `ftp.rs` refuses it by name rather than guessing. A UI that
+ * did not know the value existed would render it as "not encrypted" and warn
+ * about clear text, which is not what happens: nothing is sent at all.
+ */
+export const FTP_SECURITY = {
+  plain: 'plain',
+  explicitTls: 'explicitTls',
+  sftp: 'sftp'
+} as const;
+
+export type FtpSecurity = (typeof FTP_SECURITY)[keyof typeof FTP_SECURITY];
+
+/**
+ * Everything about an FTP destination that is *not* a secret. The password is
+ * never here, never in `settings.json`, and never crosses the IPC back (M3 §2).
+ */
+export interface FtpSettings {
+  host: string;
+  port: number;
+  username: string;
+  /** Remote directory the file is written into, e.g. `/public_html/shots`. */
+  remoteDir: string;
+  passive: boolean;
+  /**
+   * One of `FTP_SECURITY`, and typed as a plain `string` for the same reason
+   * Rust types it `String`: an unrecognised value must not make the settings
+   * file fail to parse and take every other setting down with it. Unlike
+   * `theme` there is no coercion on the way in — `ftp.rs` **refuses** a mode it
+   * does not know rather than downgrading it to plain — so the UI has to be
+   * able to represent a value outside the three. Read it through
+   * `ftpSecurityOf()`, never by comparing it to a literal.
+   */
+  security: string;
+  /**
+   * Public URL the remote directory is served at, so the copied link points at
+   * the web host rather than at an `ftp://` path. Empty means the upload
+   * reports the remote path instead of a link.
+   */
+  urlPrefix: string;
+}
+
+/**
+ * `FtpSettings.security` as one of the three known modes, or `null` when it is
+ * something else — a file written by a future build, or edited by hand.
+ *
+ * Case-folded because `ftp.rs` compares with `eq_ignore_ascii_case`: a settings
+ * file saying `"ExplicitTLS"` uploads over TLS, and a picker that showed it as
+ * unencrypted would be describing a connection that is not the one being made.
+ */
+export function ftpSecurityOf(value: string | undefined | null): FtpSecurity | null {
+  const found = (Object.values(FTP_SECURITY) as string[]).find(
+    (mode) => mode.toLowerCase() === (value ?? '').trim().toLowerCase()
+  );
+  return (found as FtpSecurity | undefined) ?? null;
+}
+
+/**
+ * What a never-configured FTP destination looks like; mirrors Rust's `Default`,
+ * **including `security: 'plain'`**. Rust is the authority on what an
+ * unconfigured destination is, and a frontend default of `explicitTls` here
+ * would draw an encrypted connection over a stored one that is not — the one
+ * lie this form must never tell (M3 §5).
+ */
+export const FTP_DEFAULTS: FtpSettings = {
+  host: '',
+  port: 21,
+  username: '',
+  remoteDir: '',
+  passive: true,
+  security: FTP_SECURITY.plain,
+  urlPrefix: ''
+};
+
+/**
+ * An imported ShareX `.sxcu`, reduced to the subset M3 §4 supports and stored
+ * as ordinary configuration. Field names transcribe the `.sxcu` vocabulary, so
+ * a user comparing this against the original in Notepad recognises every line.
+ *
+ * There is no `null` state: an **empty `name` and `requestUrl` mean nothing has
+ * been imported**, which is what Rust's `Default` writes. Test `requestUrl`
+ * rather than the object.
+ *
+ * Anything outside the subset — OAuth, `RegexList`, a body type other than the
+ * two, a non-image destination — is rejected at *import* time with a message
+ * naming the field, so this type never has to represent it. That message is the
+ * user's only explanation, so the UI shows it verbatim.
+ */
+export interface CustomUploaderSettings {
+  /** `Name` from the file. Empty means nothing has been imported. */
+  name: string;
+  /** `"POST"` or `"PUT"` — a plain string, because the file supplies it. */
+  requestMethod: string;
+  requestUrl: string;
+  /** Non-secret headers only; the credential-looking ones went to the store. */
+  headers: Record<string, string>;
+  /** `Parameters`, or `Arguments` in older files. */
+  parameters: Record<string, string>;
+  /** `"MultipartFormData"` or `"Binary"`. */
+  body: string;
+  fileFormName: string;
+  /** Response templates: `$json:path.to.field$` / `$response$`. */
+  url: string;
+  thumbnailUrl: string;
+  deletionUrl: string;
+  /**
+   * Header names whose values live in Credential Manager. The *names* are not
+   * secret — they are what lets this page show a "Configured" indicator. The
+   * values are gone from here for good.
+   */
+  secretHeaders: string[];
+}
+
+/**
+ * The "nothing imported" value, mirroring Rust's `Default`. Writing this back
+ * through `saveSettings` is how an imported uploader is forgotten — clear its
+ * credentials with `clearDestinationSecret` **first**, or their names go with
+ * the config and the values are left orphaned in Credential Manager.
+ */
+export const EMPTY_CUSTOM_UPLOADER: CustomUploaderSettings = {
+  name: '',
+  requestMethod: '',
+  requestUrl: '',
+  headers: {},
+  parameters: {},
+  body: '',
+  fileFormName: '',
+  url: '',
+  thumbnailUrl: '',
+  deletionUrl: '',
+  secretHeaders: []
+};
+
+/**
+ * One credential slot a destination defines — **a boolean, never a value**
+ * (M3 §2). `field` is what goes back to `setDestinationSecret` /
+ * `clearDestinationSecret`; `label` is what to call it on screen.
+ *
+ * Rust builds this list, which is why nothing in `src/` hard-codes a field
+ * name: a custom uploader's slots are whichever headers its `.sxcu` declared.
+ */
+export interface SecretStatus {
+  field: string;
+  label: string;
+  /** Whether an upload to this destination fails without it. */
+  required: boolean;
+  /** Whether one is stored. The whole of what the frontend ever learns. */
+  set: boolean;
+}
+
+/** One row of `destination_status()`, which returns all three in a fixed order. */
+export interface DestinationStatus {
+  kind: DestinationKind;
+  label: string;
+  /**
+   * Everything this destination needs is present — its non-secret config *and*
+   * every `required` secret — so an upload has a chance of working.
+   */
+  configured: boolean;
+  /** This is the destination uploads currently go to. */
+  active: boolean;
+  secrets: SecretStatus[];
+}
+
+/**
+ * Whether anything can be uploaded right now: the active destination exists and
+ * is `configured`. The one question the capture preview asks before offering an
+ * upload affordance at all (M3 §6).
+ */
+export function canUploadNow(status: DestinationStatus[] | null): boolean {
+  return !!status?.some((d) => d.active && d.configured);
+}
+
+/** Payload of `upload://progress`. */
+export interface UploadProgress {
+  /** `CaptureRecord.id` — the only way to tell whose progress this is. */
+  id: string;
+  /**
+   * Bytes of the *image* handed to the destination, not bytes on the wire: a
+   * multipart envelope is a few hundred bytes the user did not ask about, and
+   * counting them would put the bar at 100% before the request was done.
+   */
+  sent: number;
+  /** Total image bytes, or `0` when unknown — indeterminate, not zero-length. */
+  total: number;
+}
+
+/** Payload of `upload://done`. The record's own `url` follows on `capture://updated`. */
+export interface UploadDone {
+  id: string;
+  url: string;
+}
+
+/**
+ * Payload of `upload://error`.
+ *
+ * `message` is shown as it arrives — Rust guarantees it never interpolates a
+ * credential (M3 §2), and it is the only thing that says whether to retry, fix
+ * a credential, or wait out a rate limit.
+ *
+ * `cancelled` is an addition to the shape in M3 §6, and it matters: a cancel
+ * ends on this event too, and raising a red toast because the user got exactly
+ * what they asked for is a bug. Read the flag; never match on the message.
+ */
+export interface UploadError {
+  id: string;
+  message: string;
+  cancelled: boolean;
 }

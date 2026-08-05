@@ -23,7 +23,7 @@ reimplementation of the parts that matter, in Rust + Svelte.
 | **M2.6** | Hotkeys that bind, start to tray, top toolbar, two more themes | ✅ done |
 | **M5** | OCR, scrolling capture, smart eraser | ✅ done |
 | **M2.7** | ShareX's own layout for the `sharex` theme | ✅ done |
-| M3 | Upload destinations (Imgur, `.sxcu`, FTP) | planned |
+| **M3** | Upload destinations (Imgur, `.sxcu`, FTP/FTPS) | ✅ done |
 | M4 | Screen recording (MP4/GIF) | planned |
 | M6 | Workflows — chaining capture → action → destination | planned |
 
@@ -114,6 +114,132 @@ Two more things worth knowing, because they are deliberate:
 Tune it under **Settings › Scrolling capture**: settle delay (raise it for apps
 with smooth scrolling), wheel notches per step, and a hard frame budget.
 
+### M3 — upload destinations
+
+Three destinations: **Imgur**, **ShareX-compatible custom uploaders** (`.sxcu`),
+and **FTP / explicit FTPS**. Set them up under **Destinations** (its own pane in
+the `sharex` shell, a section of Settings otherwise).
+
+Read the next two sections before using any of them. M3 is the first milestone
+where this app sends your screen off the machine, and both are commitments
+rather than notes.
+
+#### Nothing uploads unless you asked
+
+**Uploading is opt-in, per capture.** The **Upload** action on a capture — on a
+history card, in the lightbox, or on the post-capture preview — is the only
+thing that sends it anywhere. There is no "upload everything" default:
+`autoUpload` is `false` on a fresh install *and* on an existing `settings.json`
+that predates the field, and `destination` is `none` until you pick one, so a
+default install has nowhere to send a capture even if the switch were on.
+
+The one switch that changes this lives in **Settings › Uploading**, behind a
+confirmation that states what it means: every capture, including the ones taken
+by hotkey while you are working in another app, goes to the configured
+destination the moment it is taken, and you are not asked again.
+
+A screen capture tool that uploads without being asked is a data-exfiltration
+tool with a friendly icon, so if any of the above is ever ambiguous in this app,
+treat it as a bug and report it.
+
+santi.sharex makes **no other outbound connection of any kind** — no telemetry,
+no update check, no analytics, no crash reporting. The only network traffic it
+can produce is an upload you asked for, to the destination you configured. There
+is exactly one URL compiled into the binary (`https://api.imgur.com/3/image`),
+and it is only reached by an Imgur upload.
+
+#### Credentials
+
+FTP passwords and API keys go into **Windows Credential Manager**, keyed
+`santi.sharex/<destination>/<field>` — never into `settings.json`, never into a
+log line, never into an error message. `settings.json` holds only non-secret
+configuration: host, port, user name, remote directory, which destination is
+active.
+
+The Settings page can **write** a credential and **remove** one, and can tell you
+*whether* one is set. It cannot show you one, because nothing can read one back:
+the reader is scoped to the upload modules, so no command the UI can call is able
+to reach it. That is enforced by the type system rather than by care.
+
+You can see what is stored — names only — with
+`rundll32 keymgr.dll,KRShowKeyMgr`.
+
+#### Imgur
+
+santi.sharex deliberately ships **no Imgur Client ID**. This repository is
+public, and a bundled ID would be scraped, abused and rate-limited into
+uselessness for everyone using it. Register your own at
+<https://api.imgur.com/oauth2/addclient>, choose **“Anonymous usage without user
+authorization”**, and paste the Client ID into Destinations › Imgur; the Client
+secret is not used. Uploads are anonymous, and Imgur's rate limits are reported
+as *when the quota comes back* rather than as "upload failed".
+
+#### Custom uploaders — the exact `.sxcu` subset
+
+Import a ShareX `.sxcu` and it is used as-is. **Supported, in full:**
+
+- `RequestMethod` — `POST` or `PUT` (`RequestType` accepted as the older name)
+- `RequestURL` — `http://` or `https://` only
+- `Headers` and `Parameters` (`Arguments` accepted as the older name for
+  `Parameters`); both are string maps
+- `Body` — `MultipartFormData` or `Binary` (`RequestBodyType` as the older name)
+- `FileFormName`
+- `URL` / `ThumbnailURL` / `DeletionURL` response templates
+- `$json:path.to.field$` (including `[0]` array indexes) and `$response$` inside
+  those templates
+- `{filename}` substitution in header and parameter *values*
+- `DestinationType` of `ImageUploader` or `FileUploader`
+
+**Not supported, and refused at import time with the offending field named:**
+OAuth flows (`OAuth2`), `RegexList` and `$regex:…$`, any `Body` /
+`RequestBodyType` outside the two above, any other `$…$` placeholder, and
+destination types that are not image or file uploaders (`TextUploader`,
+`URLShortener`, `URLSharingService`). A file that needs one of those is rejected
+when you import it, not accepted and then mysteriously broken on a real capture.
+
+Any header whose name looks like a credential — anything containing `auth`,
+`key`, `token`, `secret`, `password`, `credential` or `cookie` — has its value
+moved to Windows Credential Manager at import. Only the header *name* stays in
+`settings.json`.
+
+#### FTP / FTPS
+
+Plain FTP and **explicit FTPS** (`AUTH TLS`), with rustls and the same trust
+anchors HTTPS uses. There is no "accept any certificate" switch, on purpose.
+
+**SFTP is not implemented.** Despite the name it is not a variant of FTP or
+FTPS — it is a subsystem of SSH, and carrying an SSH stack for it is not
+something this app does. The picker says so rather than offering it and failing.
+
+**Plain FTP sends your password, and the file, in clear text.** That warning is
+on screen next to the switch that turns FTPS off, which is where the choice is
+actually made. Configure host, port, user name, remote directory, passive mode,
+and an optional public URL prefix so the copied link points at the web host
+rather than at an `ftp://` path.
+
+#### What "Test connection" checks
+
+It differs per destination, and the sentence it gives you says which — read it
+rather than treating a green tick as "verified":
+
+- **FTP** genuinely connects, signs in and looks at the remote directory. It
+  creates nothing; a missing directory is reported, and the first upload makes it.
+- **Imgur** checks a Client ID is saved and can be sent in a header. It does not
+  ask Imgur — the only request Imgur offers uploads a picture, and a test must
+  not leave one behind.
+- **Custom uploader** re-validates the imported file and that every credential
+  header has a value stored, and does not contact the server, for the same reason.
+
+#### Cancelling, and what a cancel means
+
+Uploads run off the UI thread and **Cancel really aborts the transfer** — the
+payload reader fails mid-chunk, which ends the HTTP body or the FTP data
+connection on the wire rather than quietly discarding a finished result. A
+part-written FTP file is removed. The one thing a cancel cannot do is un-send a
+transfer that had already completed when you pressed it; that is reported as the
+upload it was, with its link, rather than as a cancellation that leaves an
+orphan on the server.
+
 ## How santi.sharex binds hotkeys — and what its keyboard hook does
 
 Read this. It is the one part of santi.sharex that touches your keyboard
@@ -196,9 +322,10 @@ the home directory, and installs `node_modules` outside the project.
 ## Architecture
 
 `docs/ARCHITECTURE.md` (M1), `docs/ARCHITECTURE-M2.md` (M2), the
-`docs/ARCHITECTURE-M2.x.md` series and `docs/ARCHITECTURE-M5.md` are the binding
-contracts — exact command names, type shapes, event names, and design tokens.
-Read them before changing anything that crosses the Rust/TypeScript seam.
+`docs/ARCHITECTURE-M2.x.md` series, `docs/ARCHITECTURE-M3.md` and
+`docs/ARCHITECTURE-M5.md` are the binding contracts — exact command names, type
+shapes, event names, and design tokens. Read them before changing anything that
+crosses the Rust/TypeScript seam.
 
 Two things in there are load-bearing and easy to "fix" back into bugs:
 
@@ -210,27 +337,41 @@ Two things in there are load-bearing and easy to "fix" back into bugs:
   scale at runtime from `freeze.width / window.innerWidth` rather than trusting
   `devicePixelRatio`, and the editor converts pointer coordinates in exactly one
   helper. This is what keeps captures pixel-accurate across DPI settings.
+- **`upload::secrets::get` is `pub(in crate::upload)`, and must stay that way.**
+  It is the only reader of a stored credential, and its scope is what makes "no
+  command can return a secret" a compile-time property instead of a review item.
+  Widening it to `pub(crate)` would silently reopen the whole of M3 §2.
+- **`reqwest` and `suppaftp` are `default-features = false` with rustls.** The
+  defaults are native-tls, which means OpenSSL/Schannel and a C toolchain this
+  machine does not have. `cargo tree` must stay clear of `openssl-sys`,
+  `native-tls`, `libssh2-sys` and anything built with CMake.
 
 ## Known rough edges
 
 Untested at runtime, in rough order of likelihood:
 
-1. **Scrolling capture is the least reliable feature here** — see the list of
+1. **Uploading has never met a real server from this machine.** The Imgur
+   request, the `.sxcu` request and the FTP session are all unit-tested around
+   the network but not through it. The most likely first failure is an FTPS
+   handshake or a passive-mode data connection, both of which report the
+   server's own error rather than a generic one — start with **Test connection**
+   on FTP, which is the one test that genuinely connects.
+2. **Scrolling capture is the least reliable feature here** — see the list of
    what it cannot do above. It is built to stop and say so rather than produce a
    garbled image, so the common failure is a short capture with an explanation,
    not a wrong one. Content that repeats vertically with a regular period is the
    case it reads worst: a scroll of exactly one period is indistinguishable from
    not scrolling, so it may report reaching the bottom early.
-2. **A hotkey may still not fire** — if `RegisterHotKey` refuses it *and* the
+3. **A hotkey may still not fire** — if `RegisterHotKey` refuses it *and* the
    low-level hook is switched off (or cannot install), the combo stays unbound.
    Registration failures surface as a toast; Settings › Hotkeys shows which
    mechanism owns each one.
-3. **Text nudges on commit** — the inline `<textarea>` and canvas
+4. **Text nudges on commit** — the inline `<textarea>` and canvas
    `textBaseline: 'top'` disagree by a font-dependent fraction of an em.
-4. **Large-capture performance** — the editor deep-clones shapes per repaint, and
+5. **Large-capture performance** — the editor deep-clones shapes per repaint, and
    Copy/Save pushes a base64 PNG (15–25 MB on a 4K capture) through the WebView2
    IPC in one string.
-5. **Mixed-DPI multi-monitor** — crop math is DPI-safe by construction, but
+6. **Mixed-DPI multi-monitor** — crop math is DPI-safe by construction, but
    overlay *coverage* of the virtual desktop is not guaranteed.
 
 ## Fonts — why the Claude themes look different here
