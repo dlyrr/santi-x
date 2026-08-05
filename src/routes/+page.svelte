@@ -10,6 +10,7 @@
   import RegionOverlay from "$lib/overlay/RegionOverlay.svelte";
   import EditorRoot from "$lib/editor/EditorRoot.svelte";
   import CapturePreview from "$lib/preview/CapturePreview.svelte";
+  import RecorderHud from "$lib/recorder/RecorderHud.svelte";
   import ShareXShell from "$lib/shell/ShareXShell.svelte";
   import { settings } from "$lib/stores/settings.svelte";
   import { history } from "$lib/stores/history.svelte";
@@ -21,21 +22,27 @@
     type View
   } from "$lib/types";
 
-  // Resolved during init, never in onMount: the overlay, editor and preview
-  // windows must not paint a frame of the app shell before switching.
-  // adapter-static gives all four windows the same document, so ?w= is the only
+  // Resolved during init, never in onMount: the overlay, editor, preview and
+  // recorder windows must not paint a frame of the app shell before switching.
+  // adapter-static gives all five windows the same document, so ?w= is the only
   // discriminator.
   const which = new URLSearchParams(window.location.search).get("w");
   const isOverlay = which === "overlay";
   const isEditor = which === "editor";
   const isPreview = which === "preview";
+  const isRecorder = which === "recorder";
 
-  // The preview window is one edge-to-edge card, so its document must not wear
-  // the app shell's background; CapturePreview's own CSS is gated on this class.
-  // app.html stamps the overlay's equivalent pre-paint because the overlay is
-  // shown over the live desktop within the same frame it arms. This window is
-  // shown only after Rust has something to put in it, so init is early enough.
+  /** Every window that is a bare card rather than the app shell. */
+  const isChrome = isOverlay || isEditor || isPreview || isRecorder;
+
+  // The preview and the recording HUD are each one edge-to-edge card, so their
+  // documents must not wear the app shell's background; each component's own CSS
+  // is gated on its class. app.html stamps the overlay's equivalent pre-paint
+  // because the overlay is shown over the live desktop within the same frame it
+  // arms. These two are shown only after Rust has something to put in them, so
+  // init is early enough.
   if (isPreview) document.documentElement.classList.add("preview-window");
+  if (isRecorder) document.documentElement.classList.add("recorder-window");
 
   let view = $state<View>("capture");
 
@@ -61,11 +68,11 @@
     }
   }
 
-  const bootTheme = isOverlay || isEditor || isPreview ? null : cachedTheme();
+  const bootTheme = isChrome ? null : cachedTheme();
   const isShareX = $derived((settings.ready ? settings.theme : bootTheme) === "sharex");
 
   onMount(() => {
-    if (isOverlay || isEditor || isPreview) return;
+    if (isChrome) return;
 
     void settings.load();
     void history.load();
@@ -89,6 +96,8 @@
   <EditorRoot />
 {:else if isPreview}
   <CapturePreview />
+{:else if isRecorder}
+  <RecorderHud />
 {:else if isShareX}
   <!-- The `sharex` theme swaps the whole main-window shell, ShareX's own
        arrangement rather than this one wearing ShareX's colours (M2.7 §4). -->

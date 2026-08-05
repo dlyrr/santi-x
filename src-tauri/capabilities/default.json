@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window, the region-capture overlay, the annotation editor and the post-capture preview. `allow-destroy` is load-bearing: the editor registers a JS tauri://close-requested listener, which makes Tauri prevent the native close and hand the decision to the webview — @tauri-apps/api's onCloseRequested then calls destroy() itself for every event it is not told to prevent. Without the permission the editor's title-bar X silently does nothing. `preview` is listed for the same reason every window is: a label in no capability is granted nothing, so `listen('preview://show')` would be denied and the preview would sit on screen blank until its orphan timeout took it down.",
-  "windows": ["main", "overlay", "editor", "preview"],
+  "description": "Capability for the main window, the region-capture overlay, the annotation editor, the post-capture preview and the recording HUD. `allow-destroy` is load-bearing: the editor registers a JS tauri://close-requested listener, which makes Tauri prevent the native close and hand the decision to the webview — @tauri-apps/api's onCloseRequested then calls destroy() itself for every event it is not told to prevent. Without the permission the editor's title-bar X silently does nothing. `preview` is listed for the same reason every window is: a label in no capability is granted nothing, so `listen('preview://show')` would be denied and the preview would sit on screen blank until its orphan timeout took it down. `recorder` (M4 §4) is the same case with a worse failure: without it the HUD could neither hear `recorder://show` nor invoke `stop_recording`, leaving an unfocusable always-on-top card with two dead buttons over a recording that is still running.",
+  "windows": ["main", "overlay", "editor", "preview", "recorder"],
   "permissions": [
     "core:default",
     "core:window:allow-close",

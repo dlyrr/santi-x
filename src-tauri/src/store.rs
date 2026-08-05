@@ -216,7 +216,58 @@ pub struct Settings {
     pub custom_uploader: CustomUploaderSettings,
     #[serde(default)]
     pub ftp: FtpSettings,
+    /// M4 §1. An explicit ffmpeg to use. Empty — the default — means "resolve
+    /// one", which is `PATH`, then scoop, then WinGet, then Program Files.
+    /// santi.sharex never downloads one, so this is the escape hatch for a build
+    /// that lives somewhere else.
+    #[serde(default)]
+    pub ffmpeg_path: String,
+    /// M4 §6. Seven fields, all with named defaults, for the same reason M5 §4's
+    /// three have them: a bare `#[serde(default)]` would hand every existing
+    /// `settings.json` `0 fps`, an empty format string and no stop hotkey — a
+    /// feature that arrives broken on every machine that already has one, and
+    /// invisible until someone tries it.
+    #[serde(default = "default_record_fps")]
+    pub record_fps: u32,
+    /// `"mp4"` | `"gif"`. A plain `String` on the wire like `theme` and
+    /// `destination`, normalised by [`normalize_record_format`] so an
+    /// unrecognised value cannot reach the encoder.
+    #[serde(default = "default_record_format")]
+    pub record_format: String,
+    /// `h264_nvenc` instead of libx264. Off by default and deliberately so
+    /// (M4 §3): NVENC quality at low bitrates is worse, and "my recordings look
+    /// soft" is a much harder problem to diagnose than "encoding is slow".
+    #[serde(default = "default_record_hw_encode")]
+    pub record_hw_encode: bool,
+    /// GIF gets its own rate and width ceiling: a 4K 30 fps GIF is a
+    /// several-hundred-megabyte file nobody wants.
+    #[serde(default = "default_record_gif_fps")]
+    pub record_gif_fps: u32,
+    #[serde(default = "default_record_gif_max_width")]
+    pub record_gif_max_width: u32,
+    /// The global stop hotkey (M4 §4). The HUD cannot take focus, so it cannot
+    /// have a shortcut of its own — this is the one that works while the user is
+    /// in whatever they are recording.
+    #[serde(default = "default_record_stop_hotkey")]
+    pub record_stop_hotkey: String,
     pub hotkeys: Hotkeys,
+}
+
+/// Every recording format M4 implements. Mirrored by `RECORD_FORMATS` in
+/// `src/lib/types.ts`, and parsed into `record::pipeline::Format` on the way to
+/// an encoder.
+pub const RECORD_FORMATS: [&str; 2] = ["mp4", "gif"];
+
+/// Same contract as [`normalize_theme`] and [`normalize_destination`]: an
+/// unrecognised value in a hand-edited file must not reach the code that acts on
+/// it. Unknown formats become `"mp4"` — the one that plays everywhere.
+pub fn normalize_record_format(format: &str) -> String {
+    let lowered = format.trim().to_ascii_lowercase();
+    if RECORD_FORMATS.contains(&lowered.as_str()) {
+        lowered
+    } else {
+        RECORD_FORMATS[0].to_string()
+    }
 }
 
 /// An imported ShareX `.sxcu`, minus anything secret (M3 §4).
@@ -369,6 +420,33 @@ fn default_ftp_port() -> u16 {
     21
 }
 
+fn default_record_fps() -> u32 {
+    30
+}
+
+fn default_record_format() -> String {
+    RECORD_FORMATS[0].to_string()
+}
+
+/// M4 §3, spelled out rather than inferred: libx264 is the default encoder, and
+/// hardware encoding is something the user turns on knowing what it costs.
+fn default_record_hw_encode() -> bool {
+    false
+}
+
+fn default_record_gif_fps() -> u32 {
+    15
+}
+
+fn default_record_gif_max_width() -> u32 {
+    800
+}
+
+/// One past the three capture hotkeys, which are `CmdOrCtrl+Shift+1..3`.
+fn default_record_stop_hotkey() -> String {
+    "CmdOrCtrl+Shift+4".to_string()
+}
+
 /// Plain FTP is what an FTP account is unless the server was set up for TLS, so
 /// it is the value a config that never said gets. The UI is where the "this
 /// sends your password in clear text" sentence belongs (M3 §5) — a default that
@@ -408,6 +486,13 @@ impl Default for Settings {
             destination: default_destination(),
             custom_uploader: CustomUploaderSettings::default(),
             ftp: FtpSettings::default(),
+            ffmpeg_path: String::new(),
+            record_fps: default_record_fps(),
+            record_format: default_record_format(),
+            record_hw_encode: default_record_hw_encode(),
+            record_gif_fps: default_record_gif_fps(),
+            record_gif_max_width: default_record_gif_max_width(),
+            record_stop_hotkey: default_record_stop_hotkey(),
             hotkeys: Hotkeys::default(),
         }
     }
@@ -422,7 +507,8 @@ pub struct CaptureRecord {
     pub thumb: String,
     pub width: u32,
     pub height: u32,
-    /// "region" | "fullscreen" | "window" | "monitor" | "edit" | "scroll"
+    /// "region" | "fullscreen" | "window" | "monitor" | "edit" | "scroll" |
+    /// "recording"
     pub kind: String,
     pub created_at: i64,
     pub size_bytes: u64,
@@ -451,6 +537,17 @@ pub struct CaptureRecord {
     /// a normal state for an uploaded record.
     #[serde(default)]
     pub deletion_url: Option<String>,
+    /// M4 §5. How long a recording runs, as the *file* plays it: frames divided
+    /// by the frame rate, not wall clock, because dropped frames make a clip
+    /// shorter than the time it took to make.
+    ///
+    /// `None` for every record that is not a recording — which is all 82 of the
+    /// ones already on this machine's disk, none of which carry the key at all.
+    /// Same `#[serde(default)]` reasoning as `url` and `deletion_url` above, and
+    /// the same test standing behind it:
+    /// `tests::an_m3_history_file_still_loads_without_the_duration`.
+    #[serde(default)]
+    pub duration_ms: Option<u32>,
 }
 
 /// The full-desktop snapshot the region overlay draws on top of. Coordinates are
@@ -518,6 +615,16 @@ pub fn thumb_path(app: &AppHandle, id: &str) -> PathBuf {
     thumbs_dir(app).join(format!("{id}.png"))
 }
 
+/// `app_data_dir()/tmp`, created if absent. M4's GIF intermediate and its
+/// palette live here rather than in `save_dir`: they are scaffolding, they are
+/// large, and a user watching their captures folder should never see them.
+/// `record::pipeline` deletes both on every exit path, including a cancel.
+pub fn temp_dir(app: &AppHandle) -> PathBuf {
+    let dir = app_data(app).join("tmp");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
 /// `<Pictures>/santi.sharex`, created if absent. Falls back to the home dir and then
 /// to the app data dir on the rare systems where the known folder is missing.
 pub fn default_save_dir(app: &AppHandle) -> PathBuf {
@@ -553,6 +660,9 @@ pub fn load_settings(app: &AppHandle) -> Settings {
     // An unrecognised destination becomes "none", so a settings file this build
     // cannot make sense of uploads nowhere rather than somewhere (M3 §1).
     settings.destination = normalize_destination(&settings.destination);
+    // And an unrecognised recording format becomes the one that plays everywhere
+    // (M4 §6), for the same reason.
+    settings.record_format = normalize_record_format(&settings.record_format);
     settings
 }
 
@@ -662,6 +772,13 @@ fn sanitize_stem(raw: &str) -> String {
 /// Timestamps are local time — this is a user-facing file name, unlike
 /// `CaptureRecord::created_at` which is UTC millis.
 pub fn resolve_filename(pattern: &str, kind: &str, dir: &Path) -> PathBuf {
+    resolve_filename_ext(pattern, kind, dir, "png")
+}
+
+/// [`resolve_filename`] with the extension named, for M4's `.mp4` and `.gif`.
+/// The de-duplication counter goes before the extension either way, so
+/// `recording (2).mp4` and never `recording.mp4 (2)`.
+pub fn resolve_filename_ext(pattern: &str, kind: &str, dir: &Path, ext: &str) -> PathBuf {
     let now = Local::now();
     let expanded = pattern
         .replace("{kind}", kind)
@@ -678,10 +795,10 @@ pub fn resolve_filename(pattern: &str, kind: &str, dir: &Path) -> PathBuf {
         stem = format!("{kind}_{}", now.format("%Y-%m-%d_%H-%M-%S"));
     }
 
-    let mut candidate = dir.join(format!("{stem}.png"));
+    let mut candidate = dir.join(format!("{stem}.{ext}"));
     let mut n: u32 = 2;
     while candidate.exists() {
-        candidate = dir.join(format!("{stem} ({n}).png"));
+        candidate = dir.join(format!("{stem} ({n}).{ext}"));
         n += 1;
     }
     candidate
@@ -778,6 +895,66 @@ mod tests {
         assert_ne!(s.scroll_delay_ms, 0);
         assert_ne!(s.scroll_step, 0);
         assert_ne!(s.scroll_max_frames, 0);
+        assert_ne!(s.record_fps, 0);
+        assert_ne!(s.record_gif_fps, 0);
+        assert_ne!(s.record_gif_max_width, 0);
+    }
+
+    /// M4 §6 added seven fields to the same struct, and six of them are broken
+    /// at zero: 0 fps is not a recording, an empty format string is not a
+    /// container, and an empty stop hotkey is a recording that can only be
+    /// stopped from the HUD and the tray. (`ffmpegPath` is the one field whose
+    /// empty value is meaningful — it means "resolve one".)
+    #[test]
+    fn an_existing_settings_file_gains_the_recording_defaults_not_zeroes() {
+        let s: Settings = serde_json::from_str(M2_11_SETTINGS).expect("M2.11 settings must parse");
+
+        assert_eq!(s.record_fps, 30);
+        assert_eq!(s.record_format, "mp4");
+        assert!(!s.record_hw_encode, "hardware encoding is opt-in (M4 §3)");
+        assert_eq!(s.record_gif_fps, 15);
+        assert_eq!(s.record_gif_max_width, 800);
+        assert_eq!(s.record_stop_hotkey, "CmdOrCtrl+Shift+4");
+        assert!(
+            s.ffmpeg_path.is_empty(),
+            "an empty ffmpeg path means auto-resolve, and that is the default"
+        );
+
+        // And nothing the user had configured moved.
+        assert_eq!(s.theme, "sharex");
+        assert_eq!(s.hotkeys.region, "Shift+Super+S");
+    }
+
+    #[test]
+    fn an_unknown_recording_format_normalizes_to_mp4() {
+        assert_eq!(normalize_record_format("gif"), "gif");
+        assert_eq!(normalize_record_format("mp4"), "mp4");
+        // Case-folded rather than rejected: "MP4" is not a mystery.
+        assert_eq!(normalize_record_format("GIF"), "gif");
+        assert_eq!(normalize_record_format("webm"), "mp4");
+        assert_eq!(normalize_record_format(""), "mp4");
+    }
+
+    /// The extension is the only thing that changes: the pattern, the sanitising
+    /// and the ` (2)` de-duplication are shared with every screenshot.
+    #[test]
+    fn a_recording_is_named_by_the_same_pattern_with_its_own_extension() {
+        let dir = std::env::temp_dir();
+        let mp4 = resolve_filename_ext("{kind}_fixed", "recording", &dir, "mp4");
+        assert_eq!(
+            mp4.file_name().unwrap().to_string_lossy(),
+            "recording_fixed.mp4"
+        );
+
+        let gif = resolve_filename_ext("{kind}_fixed", "recording", &dir, "gif");
+        assert_eq!(
+            gif.file_name().unwrap().to_string_lossy(),
+            "recording_fixed.gif"
+        );
+
+        // And the screenshot path is unchanged.
+        let png = resolve_filename("{kind}_fixed", "region", &dir);
+        assert_eq!(png.file_name().unwrap().to_string_lossy(), "region_fixed.png");
     }
 
     /// M3 §1, guarded from three directions at once. This is the test that has
@@ -891,6 +1068,73 @@ mod tests {
         assert!(!records[2].saved && records[2].path.is_empty());
     }
 
+    /// M4 §5 added a *third* field to the same 82 records, and the failure mode
+    /// is unchanged and still the worst one in the app: without a default,
+    /// `serde_json::from_str` fails on the whole array, `load_history` swallows
+    /// that into `unwrap_or_default()`, and the user's gallery is empty and then
+    /// overwritten with `[]` by the next capture. This is the test standing
+    /// between them and that.
+    #[test]
+    fn an_m3_history_file_still_loads_without_the_duration() {
+        // The real shape on disk: no `durationMs`, and — for the older records —
+        // no `url` or `deletionUrl` either.
+        let raw = r#"[
+          {"id":"1785835580740-13","name":"region_2026-08-04_04-26-20.png",
+           "path":"C:\\Users\\santi\\Pictures\\Nimbus\\region_2026-08-04_04-26-20.png",
+           "thumb":"C:\\thumbs\\1785835580740-13.png","width":316,"height":72,
+           "kind":"region","createdAt":1785835580747,"sizeBytes":5821,
+           "saved":true,"copied":true},
+          {"id":"1785835580741-14","name":"region_2026-08-04_04-26-21.png",
+           "path":"C:\\Users\\santi\\Pictures\\Nimbus\\region_2026-08-04_04-26-21.png",
+           "thumb":"C:\\thumbs\\1785835580741-14.png","width":800,"height":600,
+           "kind":"region","createdAt":1785835580748,"sizeBytes":9001,
+           "saved":true,"copied":false,
+           "url":"https://i.imgur.com/abc123.png","deletionUrl":null}
+        ]"#;
+
+        let records: Vec<CaptureRecord> =
+            serde_json::from_str(raw).expect("an M3 history.json must still parse");
+
+        assert_eq!(records.len(), 2, "every record must survive");
+        for record in &records {
+            assert!(
+                record.duration_ms.is_none(),
+                "a screenshot has no duration, and a record that predates the field must load as None"
+            );
+        }
+        assert_eq!(records[1].url.as_deref(), Some("https://i.imgur.com/abc123.png"));
+    }
+
+    /// And the other direction: a recording round-trips its duration and its
+    /// kind, so History can label it after a restart without re-probing the
+    /// file.
+    #[test]
+    fn a_recording_round_trips_its_duration() {
+        let record = CaptureRecord {
+            id: "1785835580740-99".into(),
+            name: "recording_2026-08-04_20-00-00.mp4".into(),
+            path: r"C:\shots\recording_2026-08-04_20-00-00.mp4".into(),
+            thumb: r"C:\thumbs\1785835580740-99.png".into(),
+            width: 1280,
+            height: 720,
+            kind: "recording".into(),
+            created_at: 1785835580747,
+            size_bytes: 4_194_304,
+            saved: true,
+            copied: false,
+            url: None,
+            deletion_url: None,
+            duration_ms: Some(12_500),
+        };
+
+        let json = serde_json::to_string(&record).expect("must serialize");
+        assert!(json.contains("\"durationMs\":12500"), "camelCase on the wire");
+
+        let back: CaptureRecord = serde_json::from_str(&json).expect("must round trip");
+        assert_eq!(back.duration_ms, Some(12_500));
+        assert_eq!(back.kind, "recording");
+    }
+
     /// The other half of the round trip: a record that *has* been uploaded
     /// serialises both fields and reads them back, so History can show and
     /// re-copy the link after a restart.
@@ -910,6 +1154,7 @@ mod tests {
             copied: true,
             url: Some("https://i.imgur.com/abc123.png".into()),
             deletion_url: Some("https://imgur.com/delete/xyz".into()),
+            duration_ms: None,
         };
 
         let json = serde_json::to_string(&record).expect("must serialize");

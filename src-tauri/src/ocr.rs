@@ -98,6 +98,17 @@ pub async fn ocr_capture(app: AppHandle, id: String) -> Result<OcrResult, String
         if !Path::new(&record.path).exists() {
             return Err(format!("{} is no longer on disk", record.name));
         }
+        // M4 §5: OCR is not offered for a recording, and the same answer is
+        // given to anything that asks anyway. A GIF is the case worth naming:
+        // `image::open` would happily decode its first frame and hand back text
+        // from one arbitrary moment of a video, which is a worse answer than no
+        // answer.
+        if record.kind == crate::record::RECORD_KIND {
+            return Err(format!(
+                "There is no page of text in a video. \"{}\" is a screen recording.",
+                record.name
+            ));
+        }
 
         let img = image::open(&record.path)
             .map_err(|e| format!("could not reopen {}: {e}", record.name))?

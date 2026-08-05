@@ -8,12 +8,20 @@
   /** Mirrors `CaptureKind`; `edit` is what "Save as new" writes (M2 §3). */
   type KindFilter = 'all' | CaptureKind;
 
+  /**
+   * One row per `CaptureKind`, and this list is the only thing that makes a kind
+   * reachable — a kind missing here is a kind the user cannot filter to, which
+   * nothing in the type system notices because this is a list of options rather
+   * than an exhaustive map. `recording` (M4 §5) is the one kind that is not a
+   * still image, and so the one most worth being able to isolate.
+   */
   const KINDS: { value: KindFilter; label: string }[] = [
     { value: 'all', label: 'All kinds' },
     { value: 'region', label: 'Region' },
     { value: 'fullscreen', label: 'Fullscreen' },
     { value: 'window', label: 'Window' },
     { value: 'monitor', label: 'Monitor' },
+    { value: 'recording', label: 'Recording' },
     { value: 'edit', label: 'Edited' }
   ];
 

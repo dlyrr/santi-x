@@ -5,17 +5,30 @@
   import DestinationsView from '$lib/views/DestinationsView.svelte';
   import { PRESETS } from '$lib/editor/ColorPicker.svelte';
   import {
+    errorMessage,
     getHotkeyStatus,
     onCaptureError,
     onHotkeyStatus,
     openSaveDir,
+    recordAvailability,
+    recordFormatOf,
     DESTINATION_LABEL,
+    FFMPEG_REMEDY_BROWSE,
+    FFMPEG_SOURCE_LABEL,
+    RECORD_FORMAT_LABEL,
+    RECORD_FORMATS,
+    type FfmpegAvailability,
     type HotkeyMechanism,
     type HotkeyStatus,
+    type RecordFormat,
     type Settings,
     type Theme
   } from '$lib/api';
   import {
+    RECORD_FPS,
+    RECORD_GIF_FPS,
+    RECORD_GIF_MAX_WIDTH,
+    RECORD_STOP_HOTKEY_DEFAULT,
     SCROLL_DELAY_MS,
     SCROLL_MAX_FRAMES,
     SCROLL_STEP,
@@ -41,12 +54,23 @@
 
   type HotkeyKey = 'region' | 'fullscreen' | 'activeWindow';
 
+  /**
+   * Every binding the click-to-record control below can capture.
+   *
+   * `recordStop` is not a `Hotkeys` field — M4 §6 stores it at the top level as
+   * `Settings.recordStopHotkey` — but it is recorded, displayed and reset the
+   * same way, so it shares the control rather than getting a second one that
+   * would have to be kept in step with this one.
+   */
+  type RecordableKey = HotkeyKey | 'recordStop';
+
   // The shipped defaults, and deliberately free ones: Reset has to land on what
   // a fresh install binds, or it hands back a combo the OS already owns.
-  const HOTKEY_DEFAULTS: Record<HotkeyKey, string> = {
+  const HOTKEY_DEFAULTS: Record<RecordableKey, string> = {
     region: 'CmdOrCtrl+Shift+1',
     fullscreen: 'CmdOrCtrl+Shift+2',
-    activeWindow: 'CmdOrCtrl+Shift+3'
+    activeWindow: 'CmdOrCtrl+Shift+3',
+    recordStop: RECORD_STOP_HOTKEY_DEFAULT
   };
 
   const HOTKEY_ROWS: { key: HotkeyKey; label: string; help: string }[] = [
@@ -121,12 +145,23 @@
   let scrollDelayDraft = $state<number>(SCROLL_DELAY_MS.def);
   let scrollStepDraft = $state<number>(SCROLL_STEP.def);
   let scrollFramesDraft = $state<number>(SCROLL_MAX_FRAMES.def);
-  let recording = $state<HotkeyKey | null>(null);
+  let recordFpsDraft = $state<number>(RECORD_FPS.def);
+  let gifFpsDraft = $state<number>(RECORD_GIF_FPS.def);
+  let gifWidthDraft = $state<number>(RECORD_GIF_MAX_WIDTH.def);
+  let ffmpegDraft = $state('');
+  let ffmpeg = $state<FfmpegAvailability | null>(null);
+  let checkingFfmpeg = $state(false);
+  let recording = $state<RecordableKey | null>(null);
   let hotkeyError = $state('');
   let hotkeyStatus = $state<HotkeyStatus[]>([]);
   let version = $state('');
   let palettes = $state<Record<string, Palette>>({});
   let now = $state(Date.now());
+
+  // Derived rather than `{@const}` in the markup: `{@const}` is only legal as
+  // the direct child of a block, and this row is not inside one.
+  const stopAccel = $derived(s?.recordStopHotkey ?? RECORD_STOP_HOTKEY_DEFAULT);
+  const stopStatus = $derived(statusFor('recordStop', stopAccel));
 
   /**
    * Auto-upload is armed but not yet on: the toggle asked, and this is the
@@ -164,6 +199,33 @@
 
   $effect(() => {
     if (s) scrollFramesDraft = s.scrollMaxFrames ?? SCROLL_MAX_FRAMES.def;
+  });
+
+  // Same `??` as the scrolling drafts above, for a `settings.json` written
+  // before M4: Rust fills these in on load, but a slider bound to `undefined`
+  // renders at its midpoint and writes that midpoint back on the first drag.
+  $effect(() => {
+    if (s) recordFpsDraft = s.recordFps ?? RECORD_FPS.def;
+  });
+
+  $effect(() => {
+    if (s) gifFpsDraft = s.recordGifFps ?? RECORD_GIF_FPS.def;
+  });
+
+  $effect(() => {
+    if (s) gifWidthDraft = s.recordGifMaxWidth ?? RECORD_GIF_MAX_WIDTH.def;
+  });
+
+  $effect(() => {
+    if (s) ffmpegDraft = s.ffmpegPath ?? '';
+  });
+
+  // A successful probe is cached for the session on the Rust side, keyed by the
+  // path setting, so this is a cheap read on mount and re-resolves by itself
+  // when that setting moves. A *failure* is not cached, which is what makes
+  // "Check again" work right after the install command it just suggested.
+  $effect(() => {
+    void probeFfmpeg();
   });
 
   $effect(() => {
@@ -227,7 +289,7 @@
    * Showing it then would label a freshly typed shortcut with the last one's
    * fate, so a mismatch reads as "not known yet" and the chip is dropped.
    */
-  function statusFor(key: HotkeyKey, accelerator: string): HotkeyStatus | null {
+  function statusFor(key: RecordableKey, accelerator: string): HotkeyStatus | null {
     const found = hotkeyStatus.find((entry) => entry.action === key);
     return found && found.accelerator === accelerator.trim() ? found : null;
   }
@@ -339,6 +401,93 @@
     void patch({ scrollMaxFrames: scrollFramesDraft });
   }
 
+  /* ------------------------------------------------ screen recording (M4) */
+
+  function commitRecordFps() {
+    if (!s || recordFpsDraft === s.recordFps) return;
+    void patch({ recordFps: recordFpsDraft });
+  }
+
+  function commitGifFps() {
+    if (!s || gifFpsDraft === s.recordGifFps) return;
+    void patch({ recordGifFps: gifFpsDraft });
+  }
+
+  function commitGifWidth() {
+    if (!s || gifWidthDraft === s.recordGifMaxWidth) return;
+    void patch({ recordGifMaxWidth: gifWidthDraft });
+  }
+
+  /**
+   * Where ffmpeg is, or why it is nowhere (M4 §1).
+   *
+   * A failed *check* is not the same as a missing ffmpeg, so it leaves `ffmpeg`
+   * null and the indicator says it could not look — telling the user to install
+   * something that is already there would be worse than saying nothing.
+   */
+  async function probeFfmpeg() {
+    checkingFfmpeg = true;
+    try {
+      ffmpeg = await recordAvailability();
+    } catch {
+      ffmpeg = null;
+    } finally {
+      checkingFfmpeg = false;
+    }
+  }
+
+  /** The remedies that are commands to run, as opposed to the Browse control. */
+  const ffmpegCommands = $derived(
+    (ffmpeg?.remedies ?? []).filter((r) => r.id !== FFMPEG_REMEDY_BROWSE && r.command !== '')
+  );
+
+  /** Which resolution step produced the binary in use, named for a human. */
+  const ffmpegVia = $derived(
+    ffmpeg?.source ? (FFMPEG_SOURCE_LABEL[ffmpeg.source] ?? ffmpeg.source) : ''
+  );
+
+  /**
+   * Write the path and immediately re-check. The stored path is the first step
+   * of the resolution order, so the session cache is stale the moment it moves —
+   * and an indicator still reporting the old binary is exactly the kind of quiet
+   * lie this field exists to prevent.
+   */
+  async function saveFfmpegPath(next: string) {
+    if (!s || next === (s.ffmpegPath ?? '')) return;
+    const ok = await settings.update({ ffmpegPath: next });
+    if (!ok) {
+      toast.error(settings.error ?? 'Could not save the ffmpeg path');
+      return;
+    }
+    await probeFfmpeg();
+  }
+
+  function commitFfmpegPath() {
+    void saveFfmpegPath(ffmpegDraft.trim());
+  }
+
+  async function browseFfmpeg() {
+    try {
+      const picked = await openDirectoryDialog({
+        directory: false,
+        multiple: false,
+        defaultPath: ffmpeg?.path || undefined,
+        filters: [{ name: 'ffmpeg', extensions: ['exe'] }]
+      });
+      if (typeof picked !== 'string' || picked === '') return;
+      ffmpegDraft = picked;
+      await saveFfmpegPath(picked);
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  }
+
+  /** Clears the override and falls back to `PATH`, scoop, winget (M4 §1). */
+  async function clearFfmpegPath() {
+    ffmpegDraft = '';
+    await saveFfmpegPath('');
+  }
+
   function resolvePattern(pattern: string, kind: string, at: number): string {
     const d = new Date(at);
     const pad = (n: number) => String(n).padStart(2, '0');
@@ -421,11 +570,22 @@
     return parts.join('+');
   }
 
-  function commitHotkey(key: HotkeyKey, accel: string) {
+  /** The accelerator a row currently holds, whichever field backs it. */
+  function accelFor(key: RecordableKey): string {
+    if (!s) return '';
+    return key === 'recordStop'
+      ? (s.recordStopHotkey ?? RECORD_STOP_HOTKEY_DEFAULT)
+      : s.hotkeys[key];
+  }
+
+  function commitHotkey(key: RecordableKey, accel: string) {
     recording = null;
     hotkeyError = '';
-    if (!s || accel === s.hotkeys[key]) return;
-    void patch({ hotkeys: { ...s.hotkeys, [key]: accel } });
+    if (!s || accel === accelFor(key)) return;
+    // `recordStop` lives beside `hotkeys` rather than inside it (M4 §6), so the
+    // patch differs even though everything the user did is identical.
+    if (key === 'recordStop') void patch({ recordStopHotkey: accel });
+    else void patch({ hotkeys: { ...s.hotkeys, [key]: accel } });
   }
 
   function onWindowKeydown(event: KeyboardEvent) {
@@ -452,7 +612,7 @@
     if (accel) commitHotkey(key, accel);
   }
 
-  function resetHotkey(key: HotkeyKey) {
+  function resetHotkey(key: RecordableKey) {
     commitHotkey(key, HOTKEY_DEFAULTS[key]);
   }
 
@@ -765,6 +925,271 @@
           onchange={commitScrollFrames}
         />
         <span class="range-value mono num">{scrollFramesDraft} frames</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" aria-labelledby="sec-recording">
+    <h2 class="section-title" id="sec-recording">Screen recording</h2>
+    <p class="section-help">
+      santi.sharex <strong>finds</strong> ffmpeg — on <code class="inline-code">PATH</code>, in
+      scoop's shims, or wherever you point it — and never downloads one. Recording is disabled with
+      an explanation rather than silently failing when there is none.
+    </p>
+
+    <div class="row stack">
+      <span class="row-text">
+        <label class="row-label" for="ffmpeg-path">ffmpeg</label>
+        <span class="row-help">
+          Leave this empty to resolve automatically: <code class="inline-code">PATH</code> first,
+          then scoop's shims, then a winget or Program Files install. Set it to use one particular
+          binary instead.
+        </span>
+      </span>
+      <div class="field wide">
+        <input
+          id="ffmpeg-path"
+          class="input mono"
+          type="text"
+          spellcheck="false"
+          placeholder="Resolve automatically"
+          aria-describedby="ffmpeg-state"
+          bind:value={ffmpegDraft}
+          onchange={commitFfmpegPath}
+          onblur={commitFfmpegPath}
+        />
+        <button type="button" class="btn" onclick={browseFfmpeg}>Browse…</button>
+        <button
+          type="button"
+          class="btn subtle"
+          disabled={ffmpegDraft === ''}
+          onclick={() => void clearFfmpegPath()}
+        >
+          Clear
+        </button>
+      </div>
+
+      <!-- The live answer, not a restatement of the field: the field can be
+           empty and ffmpeg still perfectly available, which is the normal case
+           on this machine. -->
+      <p class="ffstate" id="ffmpeg-state" role="status">
+        {#if checkingFfmpeg && !ffmpeg}
+          <span class="dotmark"></span>
+          <span>Looking…</span>
+        {:else if !ffmpeg}
+          <span class="dotmark"></span>
+          <span>Could not check — nothing has been ruled out.</span>
+        {:else if ffmpeg.available}
+          <span class="dotmark ok"></span>
+          <span>
+            Found at <span class="mono">{ffmpeg.path}</span>
+            {#if ffmpegVia}<span class="muted"> via {ffmpegVia}</span>{/if}
+            {#if ffmpeg.version}<span class="muted"> — {ffmpeg.version}</span>{/if}
+          </span>
+        {:else}
+          <span class="dotmark bad"></span>
+          <span>
+            Not found — recording needs
+            {#each ffmpeg.missing as miss, i (miss.id)}
+              {#if i > 0}{i === ffmpeg.missing.length - 1 ? ' and ' : ', '}{/if}{miss.label}
+            {:else}
+              ffmpeg
+            {/each}.
+            {#if ffmpegCommands.length > 0}
+              {' '}Install it with
+              {#each ffmpegCommands as remedy, i (remedy.id)}
+                {#if i > 0}{' or '}{/if}<code class="inline-code">{remedy.command}</code>
+              {/each}.
+            {/if}
+          </span>
+        {/if}
+        <button
+          type="button"
+          class="btn subtle"
+          disabled={checkingFfmpeg}
+          onclick={() => void probeFfmpeg()}
+        >
+          {checkingFfmpeg ? 'Checking…' : 'Check again'}
+        </button>
+      </p>
+    </div>
+
+    <div class="row">
+      <span class="row-text">
+        <label class="row-label" for="record-format">Format</label>
+        <span class="row-help">
+          MP4 is H.264 in a container everything plays. GIF is two-pass — a palette is built from
+          the clip and then applied — because a single-pass GIF is a dithered mess.
+        </span>
+      </span>
+      <div class="field">
+        <select
+          id="record-format"
+          class="select"
+          value={recordFormatOf(s.recordFormat)}
+          onchange={(e) => patch({ recordFormat: e.currentTarget.value as RecordFormat })}
+        >
+          {#each RECORD_FORMATS as format (format)}
+            <option value={format}>{RECORD_FORMAT_LABEL[format]}</option>
+          {/each}
+        </select>
+      </div>
+    </div>
+
+    <div class="row">
+      <span class="row-text">
+        <label class="row-label" for="record-fps">Frame rate</label>
+        <span class="row-help">
+          How many frames a second are captured for an MP4. Higher is smoother and larger; if the
+          encoder cannot keep up, frames are dropped and counted rather than queued until memory
+          runs out.
+        </span>
+      </span>
+      <div class="field">
+        <input
+          id="record-fps"
+          class="range"
+          type="range"
+          min={RECORD_FPS.min}
+          max={RECORD_FPS.max}
+          step={RECORD_FPS.step}
+          bind:value={recordFpsDraft}
+          onchange={commitRecordFps}
+        />
+        <span class="range-value mono num">{recordFpsDraft} fps</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <span class="row-text">
+        <label class="row-label" for="gif-fps">GIF frame rate</label>
+        <span class="row-help">
+          Kept apart from the rate above on purpose: a 30fps GIF is several times the size for
+          motion the format cannot really carry.
+        </span>
+      </span>
+      <div class="field">
+        <input
+          id="gif-fps"
+          class="range"
+          type="range"
+          min={RECORD_GIF_FPS.min}
+          max={RECORD_GIF_FPS.max}
+          step={RECORD_GIF_FPS.step}
+          bind:value={gifFpsDraft}
+          onchange={commitGifFps}
+        />
+        <span class="range-value mono num">{gifFpsDraft} fps</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <span class="row-text">
+        <label class="row-label" for="gif-width">GIF maximum width</label>
+        <span class="row-help">
+          Wider recordings are scaled down to this before encoding. A 4K GIF is a
+          several-hundred-megabyte file nobody wants; the height follows the aspect ratio.
+        </span>
+      </span>
+      <div class="field">
+        <input
+          id="gif-width"
+          class="range"
+          type="range"
+          min={RECORD_GIF_MAX_WIDTH.min}
+          max={RECORD_GIF_MAX_WIDTH.max}
+          step={RECORD_GIF_MAX_WIDTH.step}
+          bind:value={gifWidthDraft}
+          onchange={commitGifWidth}
+        />
+        <span class="range-value mono num">{gifWidthDraft} px</span>
+      </div>
+    </div>
+
+    <div class="row">
+      <span class="row-text">
+        <span class="row-label" id="lbl-hw-encode">Encode MP4 on the GPU</span>
+        <span class="row-help">
+          {#if ffmpeg && ffmpeg.hardwareEncoders.length > 0}
+            Use <span class="mono">{ffmpeg.hardwareEncoders.join(', ')}</span> instead of
+            <span class="mono">libx264</span>. Faster and cheaper on the CPU, but quality at low
+            bitrates is worse — which is why the software encoder stays the default.
+          {:else if ffmpeg}
+            This ffmpeg build reports no hardware H.264 encoder, so there is nothing to switch to.
+            Recordings use <span class="mono">libx264</span>.
+          {:else}
+            Available only once ffmpeg has been found and its encoders read.
+          {/if}
+        </span>
+      </span>
+      <Toggle
+        checked={s.recordHwEncode === true}
+        labelledBy="lbl-hw-encode"
+        disabled={!ffmpeg || ffmpeg.hardwareEncoders.length === 0}
+        onchange={(v) => patch({ recordHwEncode: v })}
+      />
+    </div>
+
+    <!-- The same click-to-record control as the capture hotkeys below, because
+         it is the same gesture — it just writes a different field (M4 §6). This
+         one matters more than the others: the HUD cannot take focus, so a
+         recording with no working stop hotkey is one you may have to chase. -->
+    <div class="row">
+      <span class="row-text">
+        <span class="label-line">
+          <span class="row-label" id="lbl-hk-recordStop">Stop recording</span>
+          {#if stopStatus}
+            <span
+              class="mech"
+              class:hook={stopStatus.mechanism === 'hook'}
+              class:unbound={!stopStatus.bound}
+              title={MECHANISM_META[stopStatus.mechanism].title}
+            >
+              {MECHANISM_META[stopStatus.mechanism].label}
+            </span>
+          {/if}
+        </span>
+        <span class="row-help">
+          Works while the HUD is not focused — it never can be — so this is the route that always
+          reaches a recording, whatever is in the foreground.
+        </span>
+        {#if stopStatus && !stopStatus.bound}
+          <span class="row-danger">
+            {stopStatus.error ??
+              'Nothing is listening for this shortcut, so a recording can only be stopped from the HUD or the tray. Pick another combination, or turn on the keyboard hook fallback below.'}
+          </span>
+        {/if}
+      </span>
+      <div class="field">
+        <button
+          type="button"
+          class="hotkey"
+          class:recording={recording === 'recordStop'}
+          aria-labelledby="lbl-hk-recordStop"
+          aria-describedby="hk-value-recordStop"
+          onclick={() => (recording = recording === 'recordStop' ? null : 'recordStop')}
+          onblur={() => {
+            if (recording === 'recordStop') recording = null;
+          }}
+        >
+          {#if recording === 'recordStop'}
+            <span class="listening">Press keys…</span>
+          {:else}
+            <span class="keys" id="hk-value-recordStop">
+              {#each displayAccel(stopAccel) as part, i (i)}
+                <kbd>{part}</kbd>
+              {/each}
+            </span>
+          {/if}
+        </button>
+        <button
+          type="button"
+          class="btn subtle"
+          aria-label="Reset the stop recording shortcut to default"
+          onclick={() => resetHotkey('recordStop')}
+        >
+          Reset
+        </button>
       </div>
     </div>
   </section>
@@ -1302,6 +1727,69 @@
   .mono {
     font-family: var(--font-mono);
     font-size: 12px;
+  }
+
+  /* A command or a path named inside a sentence. Same shape as the filename
+     legend's chips, sized to sit on a line of body text without stretching it. */
+  .inline-code {
+    padding: 0 5px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 17px;
+    color: var(--text-dim);
+    background: var(--bg-inset);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    user-select: all;
+  }
+
+  /* Whether ffmpeg is actually there, live. Deliberately separate from the path
+     field: an empty field is the normal, working case on a machine where ffmpeg
+     is on PATH, so the field cannot be the indicator. */
+  .ffstate {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-dim);
+  }
+
+  .ffstate .mono {
+    color: var(--text);
+    word-break: break-all;
+  }
+
+  .ffstate .muted {
+    color: var(--text-faint);
+  }
+
+  .ffstate .btn {
+    height: 26px;
+    margin-left: auto;
+    font-size: 12px;
+  }
+
+  /* Neutral until the answer is known: asserting a colour before the probe has
+     returned would be a guess, and the two guesses are "install something you
+     already have" and "recording works" — both wrong half the time. */
+  .dotmark {
+    width: 8px;
+    height: 8px;
+    flex: none;
+    align-self: center;
+    border-radius: 50%;
+    background: var(--border-strong);
+  }
+
+  .dotmark.ok {
+    background: var(--success);
+  }
+
+  .dotmark.bad {
+    background: var(--danger);
   }
 
   .swatches {

@@ -2,8 +2,13 @@
   import { ask } from '@tauri-apps/plugin-dialog';
   import {
     cancelUpload,
+    captureIsRecording,
+    captureExtension,
+    capturePlaysAsVideo,
     copyCapture,
+    destinationAcceptsCapture,
     errorMessage,
+    formatDuration,
     onUploadError,
     onUploadProgress,
     openCapture,
@@ -54,15 +59,31 @@
   const record = $derived(records[index] ?? records[records.length - 1] ?? null);
   const hasFile = $derived(!!record && record.saved && record.path !== '');
 
+  /**
+   * This record is a screen recording, so most of this dialog's actions do not
+   * apply to it (M4 §5). Asked by kind; whether it *plays* as a video is a
+   * separate question, because a GIF recording is an image to the webview and
+   * animates in an `<img>` where a `<video>` would show nothing at all.
+   */
+  const isRecording = $derived(!!record && captureIsRecording(record));
+  const playsAsVideo = $derived(!!record && capturePlaysAsVideo(record));
+
   const uploading = $derived(!!record && uploadingId === record.id);
   const percent = $derived(total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : null);
 
   /**
-   * A destination is *selected*. Readiness is not checked here: a missing
-   * credential comes back as the upload's own error, which names what to fix.
-   * `?? 'none'` so a pre-M3 `settings.json` reads as "nowhere to send".
+   * A destination is *selected*, and it takes this record's format (M4 §5).
+   * Readiness beyond that is not checked here: a missing credential comes back
+   * as the upload's own error, which names what to fix. `?? 'none'` so a pre-M3
+   * `settings.json` reads as "nowhere to send".
+   *
+   * The format half only ever subtracts an affordance — every destination has
+   * always taken a PNG — so this cannot hide the Upload button for a still.
    */
-  const canUpload = $derived((settings.current?.destination ?? 'none') !== 'none');
+  const destination = $derived(settings.current?.destination ?? 'none');
+  const canUpload = $derived(
+    destination !== 'none' && !!record && destinationAcceptsCapture(destination, record)
+  );
   // Versioned: an edit saved over its original keeps the same path, and an
   // unchanged `src` is never re-fetched (see `versionedAssetUrl`).
   const fullSrc = $derived(record ? versionedAssetUrl(record.path, record.sizeBytes) : '');
@@ -176,6 +197,13 @@
   /** The editor is its own window, so the preview steps aside for it. */
   async function doEdit() {
     if (!record) return;
+    // The button is already disabled for a recording; this is the second half of
+    // "refuses it with a clear message rather than opening on a broken canvas"
+    // (M4 §5), for every route that is not that button.
+    if (isRecording) {
+      toast.error('The editor works on still images. This capture is a screen recording.');
+      return;
+    }
     try {
       await openEditor(record.id);
       onclose();
@@ -317,6 +345,10 @@
             <span class="num">{record.width}&times;{record.height}</span>
             <span class="sep" aria-hidden="true">&middot;</span>
             <span class="kind">{record.kind}</span>
+            {#if record.durationMs}
+              <span class="sep" aria-hidden="true">&middot;</span>
+              <span class="num">{formatDuration(record.durationMs)}</span>
+            {/if}
             <span class="sep" aria-hidden="true">&middot;</span>
             <span class="num">{formatBytes(record.sizeBytes)}</span>
             <span class="sep" aria-hidden="true">&middot;</span>
@@ -385,8 +417,27 @@
           <div class="explain">
             <h3>File is missing</h3>
             <p class="path">{record.path}</p>
-            <p>The image was moved or deleted outside santi.sharex.</p>
+            <p>
+              The {isRecording ? 'recording' : 'image'} was moved or deleted outside santi.sharex.
+            </p>
           </div>
+        {:else if playsAsVideo}
+          <!-- A recording is played, not rendered as a picture (M4 §5). Keyed on
+               `fullSrc` so navigating between records tears the element down
+               instead of leaving the previous clip's decoder attached to a new
+               `src`. `preload="metadata"` so the duration and first frame are
+               there without pulling the whole file for a clip nobody plays. -->
+          {#key fullSrc}
+            <!-- svelte-ignore a11y_media_has_caption -->
+            <video
+              class="full"
+              src={fullSrc}
+              poster={record.thumb ? versionedAssetUrl(record.thumb, record.sizeBytes) : undefined}
+              controls
+              preload="metadata"
+              onerror={() => (imgBroken = true)}
+            ></video>
+          {/key}
         {:else}
           <img
             class="full"
@@ -435,23 +486,52 @@
       <footer class="foot">
         <span class="counter num">{index + 1} of {records.length}</span>
         <div class="tools">
-          <button type="button" class="btn" disabled={!hasFile} onclick={doEdit}>Edit</button>
-          <button type="button" class="btn" disabled={!hasFile} onclick={doCopy}>Copy</button>
+          <!-- Edit and Copy are image operations, so a recording is refused
+               rather than half-supported (M4 §5): the editor would open on a
+               canvas it cannot fill, and a clipboard "image" of a video is its
+               first frame, which is a picture the user never took. -->
+          <button
+            type="button"
+            class="btn"
+            disabled={!hasFile || isRecording}
+            title={isRecording
+              ? 'The editor works on still images. This capture is a screen recording.'
+              : undefined}
+            onclick={doEdit}
+          >
+            Edit
+          </button>
+          <button
+            type="button"
+            class="btn"
+            disabled={!hasFile || isRecording}
+            title={isRecording
+              ? 'A recording cannot go on the clipboard as an image. Use Show in folder and copy the file.'
+              : undefined}
+            onclick={doCopy}
+          >
+            Copy
+          </button>
           <button type="button" class="btn" disabled={!hasFile} onclick={doOpen}>Open</button>
           <button type="button" class="btn" disabled={!hasFile} onclick={doReveal}>
             Show in folder
           </button>
-          <!-- Disabled without a file for the same reason as the rest: OCR reads
-               the PNG off disk, and `saveToDisk` off means there is none. -->
-          <button
-            type="button"
-            class="btn"
-            disabled={!hasFile}
-            title="Read the text out of this capture"
-            onclick={() => (ocrOpen = true)}
-          >
-            Extract text
-          </button>
+          <!-- Not offered at all for a recording (M4 §5) — there is no page of
+               text in a video, and a disabled button would still suggest there
+               might be. Disabled without a file for the same reason as the rest:
+               OCR reads the PNG off disk, and `saveToDisk` off means there is
+               none. -->
+          {#if !isRecording}
+            <button
+              type="button"
+              class="btn"
+              disabled={!hasFile}
+              title="Read the text out of this capture"
+              onclick={() => (ocrOpen = true)}
+            >
+              Extract text
+            </button>
+          {/if}
 
           <!-- Opt-in per capture (M3 §1): pressing this is the only reason a
                capture opened here ever leaves the machine. -->
@@ -466,7 +546,9 @@
                 ? 'This capture was not saved to disk, so there is no file to upload.'
                 : canUpload
                   ? 'Send this capture to the configured destination'
-                  : 'No upload destination is configured. Settings › Destinations.'}
+                  : destination === 'none'
+                    ? 'No upload destination is configured. Settings › Destinations.'
+                    : `The configured destination does not accept ${captureExtension(record).toUpperCase() || 'this'} files.`}
               onclick={doUpload}
             >
               Upload
@@ -492,7 +574,7 @@
 
   <!-- Outside the dialog on purpose: the lightbox traps Tab and reads the arrow
        keys on `dialogEl`, and the panel is the modal on top now. -->
-  {#if ocrOpen && hasFile}
+  {#if ocrOpen && hasFile && !isRecording}
     <OcrPanel {record} onclose={() => (ocrOpen = false)} />
   {/if}
 {/if}

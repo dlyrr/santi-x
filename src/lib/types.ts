@@ -54,6 +54,23 @@ export interface Hotkeys {
 }
 
 /**
+ * Everything a hotkey status row can describe.
+ *
+ * The three capture bindings live inside `Settings.hotkeys`; `recordStop` does
+ * not — M4 §6 puts it at the top level as `Settings.recordStopHotkey`, because
+ * it stops a recording rather than starting a capture and nothing iterating
+ * `Hotkeys` should find it. It is still registered through the same M2.6 path,
+ * so it can still be reported here.
+ *
+ * Consumers that only know about the capture three keep working: they look their
+ * own key up by name, and a row they have no opinion about is simply not found.
+ */
+export type HotkeyAction = keyof Hotkeys | 'recordStop';
+
+/** The shipped stop-recording accelerator (M4 §4). */
+export const RECORD_STOP_HOTKEY_DEFAULT = 'CmdOrCtrl+Shift+4';
+
+/**
  * Which mechanism ended up owning a hotkey (M2.6 §1).
  *
  * - `plugin` — `RegisterHotKey`, the ordinary path.
@@ -65,11 +82,11 @@ export type HotkeyMechanism = 'plugin' | 'hook' | 'none';
 
 /**
  * One row of `get_hotkey_status` / the `hotkeys://status` event. Rust rebuilds
- * the whole list on every rebind, so it is always the three actions in order.
+ * the whole list on every rebind, so it is always every action it registered.
  */
 export interface HotkeyStatus {
-  /** The `Hotkeys` field this describes. */
-  action: keyof Hotkeys;
+  /** Which binding this describes. */
+  action: HotkeyAction;
   /** The accelerator as it was registered — compare against `Settings.hotkeys`
    *  to tell a live report from one that predates an unsaved rebind. */
   accelerator: string;
@@ -135,6 +152,39 @@ export interface Settings {
   /** Hard stop on the number of frames one run may capture. */
   scrollMaxFrames: number;
   /**
+   * Where to find ffmpeg, or `''` to resolve it (M4 §1). santi.sharex **finds**
+   * ffmpeg and never downloads one, so this is the escape hatch for a machine
+   * where none of the four resolution steps hits: the user points at a binary
+   * and recording works.
+   */
+  ffmpegPath: string;
+  /** Capture rate, 5–60. See `RECORD_FPS`. */
+  recordFps: number;
+  /**
+   * `'mp4'` or `'gif'`, and a plain `string` for the same reason `theme` is —
+   * a hand-edited or future `settings.json` can name something else, and one
+   * unknown value must not take every other setting down with it. Read it
+   * through `recordFormatOf()`, never by comparing to a literal.
+   */
+  recordFormat: string;
+  /**
+   * Encode MP4 with the GPU (`h264_nvenc` and friends) instead of `libx264`.
+   * Default **false**: NVENC quality at low bitrates is worse and its failure
+   * mode is confusing (M4 §3), so this is opt-in and only offered when the
+   * ffmpeg probe actually found a hardware encoder.
+   */
+  recordHwEncode: boolean;
+  /** GIF capture rate, kept apart from `recordFps`: 30fps GIF is unshareable. */
+  recordGifFps: number;
+  /** GIFs are downscaled to at most this many pixels wide. */
+  recordGifMaxWidth: number;
+  /**
+   * The global stop-recording accelerator (M4 §4). Not inside `hotkeys` — see
+   * `HotkeyAction`. It is what makes a recording stoppable while the HUD, which
+   * cannot take focus, is not reachable.
+   */
+  recordStopHotkey: string;
+  /**
    * Where the **Upload** action sends a capture (M3 §1). `'none'` is the
    * shipped default and the out-of-box state: nothing can leave the machine
    * until the user picks a destination and configures it.
@@ -183,8 +233,20 @@ export const SCROLL_MAX_FRAMES = { min: 5, max: 200, step: 5, def: 60 } as const
  * `scroll` is a stitched scrolling capture (M5 §4), which goes through the same
  * `finalize()` as everything else and so is an ordinary record in every other
  * respect.
+ *
+ * `recording` is the one kind that is **not** a still image (M4 §5). Every place
+ * that renders, edits, copies, reads text out of or uploads a record has to ask
+ * before assuming a PNG is behind it — `captureIsRecording` and
+ * `capturePlaysAsVideo` below are how, so no view matches the string itself.
  */
-export type CaptureKind = 'region' | 'fullscreen' | 'window' | 'monitor' | 'edit' | 'scroll';
+export type CaptureKind =
+  | 'region'
+  | 'fullscreen'
+  | 'window'
+  | 'monitor'
+  | 'edit'
+  | 'scroll'
+  | 'recording';
 
 export interface CaptureRecord {
   id: string;
@@ -212,6 +274,272 @@ export interface CaptureRecord {
   url: string | null;
   /** The destination's delete URL, when it hands one back. Same serde default. */
   deletionUrl: string | null;
+  /**
+   * How long a recording runs, in milliseconds, or `null` for everything else
+   * (M4 §5).
+   *
+   * `#[serde(default)]` on the Rust side for the same reason `url` is: the 82
+   * records already on this machine carry no such key and must keep loading, so
+   * a pre-M4 record arrives here with the field **absent** rather than null.
+   * Test it for truthiness, never for `null`.
+   */
+  durationMs: number | null;
+}
+
+/* ------------------------------------------------- screen recording (M4) */
+
+/** The two containers M4 ships. Mirrors `RecordFormat` on the Rust side. */
+export const RECORD_FORMATS = ['mp4', 'gif'] as const;
+
+export type RecordFormat = (typeof RECORD_FORMATS)[number];
+
+/** What an unrecognised `Settings.recordFormat` is read as. */
+export const DEFAULT_RECORD_FORMAT: RecordFormat = 'mp4';
+
+export function isRecordFormat(value: unknown): value is RecordFormat {
+  return typeof value === 'string' && (RECORD_FORMATS as readonly string[]).includes(value);
+}
+
+/**
+ * `Settings.recordFormat` as one of the two, coerced rather than refused: unlike
+ * `FtpSettings.security`, where guessing would misdescribe a live connection,
+ * the worst a wrong guess does here is start a recording in the other container,
+ * and a picker with no selection at all is worse.
+ */
+export function recordFormatOf(value: string | undefined | null): RecordFormat {
+  const found = (RECORD_FORMATS as readonly string[]).find(
+    (format) => format === (value ?? '').trim().toLowerCase()
+  );
+  return (found as RecordFormat | undefined) ?? DEFAULT_RECORD_FORMAT;
+}
+
+export const RECORD_FORMAT_LABEL: Record<RecordFormat, string> = {
+  mp4: 'MP4',
+  gif: 'GIF'
+};
+
+/**
+ * Bounds and defaults for the recording settings, beside the fields they
+ * describe so the sliders and Rust's clamps cannot drift apart — the same
+ * arrangement as `SCROLL_*` above. `def` is what a fresh install writes (M4 §6).
+ */
+export const RECORD_FPS = { min: 5, max: 60, step: 1, def: 30 } as const;
+export const RECORD_GIF_FPS = { min: 5, max: 30, step: 1, def: 15 } as const;
+export const RECORD_GIF_MAX_WIDTH = { min: 320, max: 1920, step: 40, def: 800 } as const;
+
+/** Where the frames come from (M4 §2). All three reuse an existing picker. */
+export const RECORD_SOURCES = ['region', 'window', 'monitor'] as const;
+
+export type RecordSourceKind = (typeof RECORD_SOURCES)[number];
+
+/**
+ * The source half of a `RecordSpec`. Internally tagged on **`type`**, matching
+ * `#[serde(tag = "type", rename_all = "camelCase")] enum RecordSource` — not
+ * `kind`, which is what `CaptureRecord` already uses for something else.
+ *
+ * A region carries its rect in **absolute xcap physical screen pixels**, the
+ * same space `WindowRect` and `ArmPayload.originX/originY` live in: a caller
+ * working from the region overlay adds the freeze frame's origin before sending.
+ * Window and monitor carry the id from the pickers the capture view already has.
+ *
+ * The rect is fixed at start whichever source it came from — a window that moves
+ * or resizes mid-recording keeps the rect it had (M4 §2).
+ */
+export type RecordSource =
+  | { type: 'region'; x: number; y: number; width: number; height: number }
+  | { type: 'window'; id: number }
+  | { type: 'monitor'; id: number };
+
+/**
+ * What `start_recording` is asked for.
+ *
+ * Everything but the source is optional, and **omitting it means "whatever
+ * Settings says"**. An explicit value overrides for this one recording and is
+ * never written back, so the capture screen's format picker does not silently
+ * rewrite the setting the user chose in Settings.
+ */
+export interface RecordSpec {
+  source: RecordSource;
+  format?: RecordFormat;
+  fps?: number;
+  captureCursor?: boolean;
+  hwEncode?: boolean;
+}
+
+/**
+ * The recorder's whole model: what `recording_status()` returns and what
+ * `record://status` carries. One event, emitted on start, about four times a
+ * second while a recording runs, and once more as `idle` when it ends.
+ *
+ * `active: false` with `phase: 'idle'` is the resting state, and it is a real
+ * value rather than an absence — the HUD reads it as "there is nothing to
+ * describe" and takes itself off screen.
+ */
+export interface RecordStatus {
+  active: boolean;
+  /** Identifies the recording, so a late event for a finished one is ignorable. */
+  id: string;
+  /** One of `RECORD_PHASES`, and a plain string so an added phase still renders. */
+  phase: string;
+  /** Wall clock since the first frame. The file may be shorter — see `dropped`. */
+  elapsedMs: number;
+  frames: number;
+  /**
+   * Frames the encoder could not be handed. **Not** the frames the pacer skipped
+   * because the screen updates faster than the recording rate — those are
+   * downsampling, not loss — so a non-zero value here is worth showing.
+   */
+  dropped: number;
+  width: number;
+  height: number;
+  fps: number;
+  /** `'mp4'` or `'gif'`. */
+  format: string;
+  /** `'region'`, `'window'` or `'monitor'`. */
+  source: string;
+  cursor: boolean;
+  /** The MP4 is being encoded on the GPU. */
+  hardware: boolean;
+  /** The stop accelerator, or `''` when nothing claimed it — say so, never lie. */
+  stopHotkey: string;
+  outputName: string;
+}
+
+/**
+ * The phases a recording moves through. Read for display only: `phase` is typed
+ * as a plain string precisely so a build that grows a phase this one has never
+ * heard of still renders it rather than falling through to nothing.
+ */
+export const RECORD_PHASES = [
+  'idle',
+  'starting',
+  'recording',
+  'finishing',
+  'encoding',
+  'done'
+] as const;
+
+/** What a finished recording produced. Payload of `record://finished` / `record://cancelled`. */
+export interface RecordOutcome {
+  /** `null` for a cancel, which by definition kept nothing. */
+  record: CaptureRecord | null;
+  frames: number;
+  dropped: number;
+  durationMs: number;
+  cancelled: boolean;
+  /**
+   * ffmpeg had to be killed, so the file may be missing its last moments. Said
+   * out loud rather than hidden behind a record that looks like any other.
+   */
+  truncated: boolean;
+}
+
+/* ------------------------------------------------------------- ffmpeg (M4 §1) */
+
+/** One thing that is not there. `id` is switchable; `label` is a noun phrase. */
+export interface FfmpegMissing {
+  id: string;
+  label: string;
+}
+
+/**
+ * A fix the user can run, verbatim. `command` is **empty** for
+ * `FFMPEG_REMEDY_BROWSE`, which is a control in the UI rather than something to
+ * paste — so render the commands and the Browse button from the same list
+ * instead of hard-coding either.
+ */
+export interface FfmpegRemedy {
+  id: string;
+  label: string;
+  command: string;
+}
+
+export const FFMPEG_REMEDY_BROWSE = 'browse';
+
+/** A location that was tried, and what came of it. */
+export interface FfmpegAttempt {
+  source: string;
+  path: string;
+  /** `'ok'` | `'notFound'` | `'unusable'`. */
+  outcome: string;
+  detail: string | null;
+}
+
+/**
+ * Whether recording can be offered at all, and what to say when it cannot
+ * (M4 §1).
+ *
+ * santi.sharex **finds** ffmpeg and never downloads one — fetching and executing
+ * an ~80MB binary sits badly beside M3 §1's consent rules — so "unavailable" is
+ * a state the UI renders properly rather than a transient one it waits out.
+ * `missing` says what is absent, `remedies` are the exact commands that fix it,
+ * and `searched` is where santi.sharex looked, so a user whose ffmpeg lives
+ * somewhere unusual can see that it did.
+ *
+ * **Never render a download affordance from any of this.**
+ */
+export interface FfmpegAvailability {
+  /** True only when a binary answered *and* it has every encoder M4 needs. */
+  available: boolean;
+  path: string;
+  version: string;
+  /** Which resolution step hit: `setting`, `path`, `scoop`, `winget`, … */
+  source: string;
+  encoders: string[];
+  hardwareEncoders: string[];
+  /** Empty exactly when `available` is true. */
+  missing: FfmpegMissing[];
+  remedies: FfmpegRemedy[];
+  searched: FfmpegAttempt[];
+}
+
+/**
+ * How each resolution step is named on screen. A source this build has no name
+ * for falls back to the raw id rather than to a blank, because the point of
+ * showing it at all is answering "why is it using *that* ffmpeg".
+ */
+export const FFMPEG_SOURCE_LABEL: Record<string, string> = {
+  setting: 'the path you set',
+  path: 'PATH',
+  scoop: 'scoop',
+  winget: 'winget',
+  programFiles: 'Program Files'
+};
+
+/** Whether this record is a screen recording rather than a still image. */
+export function captureIsRecording(record: CaptureRecord): boolean {
+  return record.kind === 'recording';
+}
+
+/** The record's file extension, lowercased and without the dot. `''` when none. */
+export function captureExtension(record: CaptureRecord): string {
+  const name = record.path || record.name;
+  const dot = name.lastIndexOf('.');
+  return dot === -1 ? '' : name.slice(dot + 1).toLowerCase();
+}
+
+/**
+ * Whether the record needs a `<video>` element rather than an `<img>` (M4 §5).
+ *
+ * A recording is not automatically a video: a GIF recording *is* an image as far
+ * as the webview is concerned, and it animates in an `<img>` while a `<video>`
+ * would show nothing at all. So this asks about the file, not about the kind.
+ */
+export function capturePlaysAsVideo(record: CaptureRecord): boolean {
+  return captureIsRecording(record) && captureExtension(record) !== 'gif';
+}
+
+/**
+ * Formats such as `MM:SS`, or `H:MM:SS` past an hour. For durations, so it pads
+ * minutes and seconds but never the leading unit.
+ */
+export function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const seconds = total % 60;
+  const minutes = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${minutes}:${pad(seconds)}`;
 }
 
 export interface MonitorInfo {
@@ -614,6 +942,43 @@ export interface DestinationStatus {
  */
 export function canUploadNow(status: DestinationStatus[] | null): boolean {
   return !!status?.some((d) => d.active && d.configured);
+}
+
+/**
+ * File extensions a destination will take, or `null` for "anything" (M4 §5).
+ *
+ * Only Imgur constrains, and it is the one whose list can be stated as fact: it
+ * publishes what it accepts, and a video it rejects comes back as an error the
+ * user cannot act on. FTP is a file server and takes any bytes. A custom
+ * uploader depends entirely on its `.sxcu`, which declares no format — so the
+ * honest answer there is "try it", with the server's own refusal as the
+ * authority, exactly as M3 treats every other custom-uploader failure.
+ */
+export const DESTINATION_ACCEPTS: Record<DestinationKind, readonly string[] | null> = {
+  imgur: ['png', 'jpg', 'jpeg', 'gif', 'apng', 'tiff', 'mp4', 'webm', 'mov', 'avi'],
+  custom: null,
+  ftp: null
+};
+
+/**
+ * Whether the active destination will take this record's format.
+ *
+ * The gate on offering the Upload action for a recording (M4 §5): an MP4 button
+ * that a destination is going to refuse is worse than no button. Still images
+ * are unaffected — every destination has always taken a PNG — so this only ever
+ * subtracts an affordance for a format that is genuinely at risk.
+ */
+export function destinationAcceptsCapture(
+  destination: DestinationChoice,
+  record: CaptureRecord
+): boolean {
+  if (destination === 'none') return false;
+  const accepts = DESTINATION_ACCEPTS[destination];
+  if (accepts === null) return true;
+  const ext = captureExtension(record);
+  // No extension to judge by — a record whose file was never written. The
+  // caller's own `hasFile` check is what stops that reaching an upload.
+  return ext === '' || accepts.includes(ext);
 }
 
 /** Payload of `upload://progress`. */

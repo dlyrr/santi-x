@@ -938,6 +938,8 @@ mod tests {
             copied: true,
             url: None,
             deletion_url: None,
+            // M4 §5 added the field; a screenshot has no duration.
+            duration_ms: None,
         }
     }
 

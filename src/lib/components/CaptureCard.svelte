@@ -2,8 +2,12 @@
   import { ask } from '@tauri-apps/plugin-dialog';
   import {
     cancelUpload,
+    captureExtension,
+    captureIsRecording,
     copyCapture,
+    destinationAcceptsCapture,
     errorMessage,
+    formatDuration,
     onUploadError,
     onUploadProgress,
     openCapture,
@@ -56,6 +60,19 @@
   const hasFile = $derived(record.saved && record.path !== '');
 
   /**
+   * This record is a screen recording, so the image actions on this card do not
+   * apply to it (M4 §5) — the same question the lightbox asks about the same
+   * record. Asked by `kind`, never by extension: a GIF recording is still a
+   * recording, even though the webview happily animates it in an `<img>`.
+   *
+   * Without this, Edit / Copy / Extract text are live buttons that end in one of
+   * Rust's `could not reopen …` errors, because every one of them is
+   * `image::open` on an MP4. A refusal the button itself makes, with a sentence
+   * saying why, is the whole difference.
+   */
+  const isRecording = $derived(captureIsRecording(record));
+
+  /**
    * A destination is *selected*. Not the same as it being ready — a missing
    * credential surfaces as the upload's own error, which names what to fix,
    * where a disabled button with no explanation would not.
@@ -64,7 +81,14 @@
    * `destination` at all, and an absent field must read as "nowhere to send",
    * never as "somewhere".
    */
-  const canUpload = $derived((settings.current?.destination ?? 'none') !== 'none');
+  const destination = $derived(settings.current?.destination ?? 'none');
+
+  /**
+   * …and that it will take this record's format (M4 §5). Still images are
+   * unaffected — every destination has always taken a PNG — so this only ever
+   * subtracts the button for a format the destination is going to refuse.
+   */
+  const canUpload = $derived(destination !== 'none' && destinationAcceptsCapture(destination, record));
   const percent = $derived(total > 0 ? Math.min(100, Math.round((sent / total) * 100)) : null);
   // Versioned: an edit saved over its original keeps the same thumbnail path,
   // and an unchanged `src` is never re-fetched (see `versionedAssetUrl`).
@@ -113,6 +137,14 @@
 
   async function doCopy(event: MouseEvent) {
     event.stopPropagation();
+    // The button is already disabled for a recording; this is the second half of
+    // the same guard, for a keyboard or programmatic route that gets past it.
+    if (isRecording) {
+      toast.error(
+        'A recording cannot go on the clipboard as an image. Use Show in folder and copy the file.'
+      );
+      return;
+    }
     try {
       await copyCapture(record.id);
       toast.success('Copied to clipboard');
@@ -123,6 +155,10 @@
 
   async function doEdit(event: MouseEvent) {
     event.stopPropagation();
+    if (isRecording) {
+      toast.error('The editor works on still images. This capture is a screen recording.');
+      return;
+    }
     try {
       await openEditor(record.id);
     } catch (err) {
@@ -239,6 +275,7 @@
   // the working state instead of the card holding a spinner it cannot explain.
   function doExtractText(event: MouseEvent) {
     event.stopPropagation();
+    if (isRecording) return;
     ocrOpen = true;
   }
 
@@ -293,12 +330,16 @@
     {/if}
 
     <div class="actions">
+      <!-- Edit and Copy are image operations, so a recording is refused rather
+           than left to fail in Rust (M4 §5): the editor would open on a canvas
+           it cannot fill, and a clipboard "image" of a video is its first frame
+           at best. -->
       <button
         type="button"
         class="act"
-        title="Edit"
+        title={isRecording ? 'The editor works on still images. This capture is a screen recording.' : 'Edit'}
         aria-label="Edit {record.name}"
-        disabled={!hasFile}
+        disabled={!hasFile || isRecording}
         onclick={doEdit}
       >
         <svg
@@ -320,9 +361,11 @@
       <button
         type="button"
         class="act"
-        title="Copy to clipboard"
+        title={isRecording
+          ? 'A recording cannot go on the clipboard as an image. Use Show in folder and copy the file.'
+          : 'Copy to clipboard'}
         aria-label="Copy {record.name} to clipboard"
-        disabled={!hasFile}
+        disabled={!hasFile || isRecording}
         onclick={doCopy}
       >
         <svg
@@ -421,7 +464,9 @@
             ? 'That capture was not saved to disk, so there is no file to upload.'
             : canUpload
               ? 'Upload to the configured destination'
-              : 'No upload destination is configured. Settings › Destinations.'}
+              : destination === 'none'
+                ? 'No upload destination is configured. Settings › Destinations.'
+                : `The configured destination does not accept ${captureExtension(record).toUpperCase() || 'this'} files.`}
           aria-label="Upload {record.name}"
           disabled={!hasFile || !canUpload}
           onclick={doUpload}
@@ -470,34 +515,38 @@
       {/if}
 
       <!-- OCR reads the PNG off disk, so this is dead without one, exactly like
-           the four actions above it. -->
-      <button
-        type="button"
-        class="act"
-        title="Extract text"
-        aria-label="Extract text from {record.name}"
-        disabled={!hasFile}
-        onclick={doExtractText}
-      >
-        <svg
-          viewBox="0 0 16 16"
-          width="16"
-          height="16"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
+           the four actions above it. Not offered at all for a recording (M4 §5)
+           — there is no page of text in a video, and a disabled button would
+           still suggest there might be. -->
+      {#if !isRecording}
+        <button
+          type="button"
+          class="act"
+          title="Extract text"
+          aria-label="Extract text from {record.name}"
+          disabled={!hasFile}
+          onclick={doExtractText}
         >
-          <path d="M2.5 5.75v-2.25a1 1 0 0 1 1-1h2.25" />
-          <path d="M10.25 2.5h2.25a1 1 0 0 1 1 1v2.25" />
-          <path d="M13.5 10.25v2.25a1 1 0 0 1-1 1h-2.25" />
-          <path d="M5.75 13.5H3.5a1 1 0 0 1-1-1v-2.25" />
-          <path d="M5.25 6.5h5.5" />
-          <path d="M5.25 9.5h3.5" />
-        </svg>
-      </button>
+          <svg
+            viewBox="0 0 16 16"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M2.5 5.75v-2.25a1 1 0 0 1 1-1h2.25" />
+            <path d="M10.25 2.5h2.25a1 1 0 0 1 1 1v2.25" />
+            <path d="M13.5 10.25v2.25a1 1 0 0 1-1 1h-2.25" />
+            <path d="M5.75 13.5H3.5a1 1 0 0 1-1-1v-2.25" />
+            <path d="M5.25 6.5h5.5" />
+            <path d="M5.25 9.5h3.5" />
+          </svg>
+        </button>
+      {/if}
 
       <button
         type="button"
@@ -555,6 +604,13 @@
     <span class="name" title={record.name}>{record.name}</span>
     <span class="meta">
       <span class="num">{record.width}&times;{record.height}</span>
+      <!-- The thumbnail of a recording is a frame from the middle of the clip,
+           which is to say it looks exactly like a screenshot. The run time is
+           the one thing in this row that says otherwise. -->
+      {#if record.durationMs}
+        <span class="dot" aria-hidden="true">&middot;</span>
+        <span class="num">{formatDuration(record.durationMs)}</span>
+      {/if}
       <span class="dot" aria-hidden="true">&middot;</span>
       <span>{relativeTime(record.createdAt)}</span>
     </span>
@@ -563,7 +619,7 @@
 
 <!-- Portals itself out to <body>, so the card's hover lift cannot become the
      containing block for its fixed scrim. -->
-{#if ocrOpen && hasFile}
+{#if ocrOpen && hasFile && !isRecording}
   <OcrPanel {record} onclose={() => (ocrOpen = false)} />
 {/if}
 

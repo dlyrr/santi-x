@@ -31,6 +31,7 @@
   import { settings } from "$lib/stores/settings.svelte";
   import { history } from "$lib/stores/history.svelte";
   import {
+    captureIsRecording,
     errorMessage,
     getHotkeyStatus,
     onHotkeyStatus,
@@ -195,8 +196,16 @@
       icon: "video",
       ink: SHAREX_ICON_INK.recorder,
       name: "Screen recorder",
-      desc: "Record the screen to GIF or MP4.",
-      milestone: "M4"
+      desc: "Record a region, a window or a display to MP4 or GIF. Opens the Capture screen.",
+      // M4 shipped recording, so this row can no longer wear an "M4" tag — a
+      // milestone that has already landed is as inaccurate as a fake feature.
+      // It routes to Capture rather than duplicating the flow, for the same
+      // reason Scrolling capture does: the source pickers, the ffmpeg state and
+      // the Stop already live there, and one screen is the honest version.
+      hint: "Opens Capture, where the source pickers and the recorder's controls live.",
+      run: () => {
+        pane = "capture";
+      }
     },
     {
       icon: "scan",
@@ -209,6 +218,10 @@
         // thumbnail, and OCR on a 480px thumbnail is not worth offering.
         if (!latest?.path) {
           toast.error("That capture was not saved to disk, so there is no image to read.");
+          return;
+        }
+        if (captureIsRecording(latest)) {
+          toast.error("There is no page of text in a video. Your most recent capture is a recording.");
           return;
         }
         ocrOpen = true;
@@ -322,6 +335,15 @@
   const s = $derived(settings.current);
   const latest = $derived(history.items[0]);
 
+  /**
+   * Both `needsCapture` rows — the image editor and OCR — are image operations,
+   * and the most recent capture is exactly where a recording lands (M4 §5). So
+   * "there is a capture" is not enough of a question to ask: a row that acts on
+   * the latest capture has to know whether that capture is a picture, or it ends
+   * in one of Rust's `could not reopen …` errors from `image::open` on an MP4.
+   */
+  const latestIsImage = $derived(latest !== undefined && !captureIsRecording(latest));
+
   onMount(() => {
     getVersion()
       .then((v) => (version = v))
@@ -397,6 +419,12 @@
   async function editLatest(): Promise<void> {
     const record = latest;
     if (!record) return;
+    // The row is already blocked for a recording; this is the second half of the
+    // same guard, and the same sentence the lightbox and the history card use.
+    if (captureIsRecording(record)) {
+      toast.error("The editor works on still images. Your most recent capture is a recording.");
+      return;
+    }
     try {
       await openEditor(record.id);
     } catch (err) {
@@ -475,7 +503,9 @@
         <h1 class="flat-title">Tools</h1>
         <div class="grid">
           {#each TOOLS as tool (tool.name)}
-            {@const blocked = tool.milestone !== undefined || (tool.needsCapture === true && !latest)}
+            {@const blocked =
+              tool.milestone !== undefined ||
+              (tool.needsCapture === true && (!latest || !latestIsImage))}
             <button
               type="button"
               class="tool"
@@ -485,7 +515,9 @@
                 ? `${tool.name} arrives in ${tool.milestone}.`
                 : tool.needsCapture && !latest
                   ? "Take a capture first — this acts on an image you already have."
-                  : tool.hint}
+                  : tool.needsCapture && !latestIsImage
+                    ? "Your most recent capture is a screen recording, and this acts on a still image."
+                    : tool.hint}
               onclick={() => {
                 if (!blocked) tool.run?.();
               }}
@@ -499,6 +531,8 @@
                 <span class="tag">{tool.milestone}</span>
               {:else if tool.needsCapture && !latest}
                 <span class="tag">No captures yet</span>
+              {:else if tool.needsCapture && !latestIsImage}
+                <span class="tag">Latest is a recording</span>
               {/if}
             </button>
           {/each}
@@ -588,7 +622,7 @@
 
 <!-- Tools › OCR. `latest.path` is re-checked here because the record can be
      deleted from History while the panel is open. -->
-{#if ocrOpen && latest?.path}
+{#if ocrOpen && latest?.path && latestIsImage}
   <OcrPanel record={latest} onclose={() => (ocrOpen = false)} />
 {/if}
 

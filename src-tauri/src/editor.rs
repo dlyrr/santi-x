@@ -121,6 +121,19 @@ pub async fn close_editor(app: AppHandle) -> Result<(), String> {
 /// waiting on the event loop and would deadlock, exactly as in `overlay.rs`.
 pub(crate) fn open_editor_blocking(app: &AppHandle, id: &str) -> Result<(), String> {
     let record = store::capture_by_id(app, id)?;
+
+    // M4 §5: the editor refuses a recording *with a clear message* rather than
+    // opening on a broken canvas. Every UI that offers Edit already asks this
+    // question, so reaching here means a path that did not — and the failure
+    // without this check is not an error dialog, it is an editor window sitting
+    // open on nothing while `image::open` chokes on an MP4 behind it.
+    if record.kind == crate::record::RECORD_KIND {
+        return Err(format!(
+            "The editor works on still images. \"{}\" is a screen recording.",
+            record.name
+        ));
+    }
+
     let title = format!("Edit — {}", record.name);
 
     // One editor at a time (M2 §1): a second request re-points the live window

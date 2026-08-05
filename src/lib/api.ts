@@ -14,11 +14,15 @@ import type {
   CaptureRecord,
   DestinationKind,
   DestinationStatus,
+  FfmpegAvailability,
   FreezeInfo,
   HotkeyStatus,
   MonitorInfo,
   OcrResult,
   Rect,
+  RecordOutcome,
+  RecordSpec,
+  RecordStatus,
   ScrollOutcome,
   ScrollProgress,
   Settings,
@@ -41,9 +45,14 @@ export type {
   DestinationChoice,
   DestinationKind,
   DestinationStatus,
+  FfmpegAttempt,
+  FfmpegAvailability,
+  FfmpegMissing,
+  FfmpegRemedy,
   FreezeInfo,
   FtpSecurity,
   FtpSettings,
+  HotkeyAction,
   HotkeyMechanism,
   Hotkeys,
   HotkeyStatus,
@@ -51,6 +60,12 @@ export type {
   OcrLine,
   OcrResult,
   Rect,
+  RecordFormat,
+  RecordOutcome,
+  RecordSource,
+  RecordSourceKind,
+  RecordSpec,
+  RecordStatus,
   ScrollOutcome,
   ScrollProgress,
   ScrollStopReason,
@@ -66,15 +81,33 @@ export type {
 } from '$lib/types';
 export {
   canUploadNow,
+  captureExtension,
+  captureIsRecording,
+  capturePlaysAsVideo,
+  DESTINATION_ACCEPTS,
   DESTINATION_KINDS,
   DESTINATION_LABEL,
+  destinationAcceptsCapture,
   EMPTY_CUSTOM_UPLOADER,
+  FFMPEG_REMEDY_BROWSE,
+  FFMPEG_SOURCE_LABEL,
+  formatDuration,
   FTP_DEFAULTS,
   FTP_SECURITY,
   ftpSecurityOf,
   IMGUR_REGISTER_URL,
   isDestinationKind,
+  isRecordFormat,
   isScrollStopReason,
+  RECORD_FORMAT_LABEL,
+  RECORD_FORMATS,
+  RECORD_FPS,
+  RECORD_GIF_FPS,
+  RECORD_GIF_MAX_WIDTH,
+  RECORD_PHASES,
+  RECORD_SOURCES,
+  RECORD_STOP_HOTKEY_DEFAULT,
+  recordFormatOf,
   SCROLL_DELAY_MS,
   SCROLL_MAX_FRAMES,
   SCROLL_STEP,
@@ -244,6 +277,100 @@ export async function startScrollCapture(id: number): Promise<ScrollOutcome> {
  */
 export async function cancelScrollCapture(): Promise<void> {
   await invoke<void>('cancel_scroll_capture');
+}
+
+/* -------------------------------------------------- screen recording (M4) */
+
+/**
+ * Whether recording can be offered at all, and what to say when it cannot
+ * (M4 §1).
+ *
+ * Cheap: a successful probe is cached for the session on the Rust side, keyed by
+ * the `Settings.ffmpegPath` it was resolved under, so changing that setting
+ * re-resolves rather than being ignored. A *failure* is deliberately not cached
+ * — the user's next move after reading the message is usually to run the command
+ * it just gave them, and they should not have to restart the app for that to be
+ * noticed. So there is no `refresh` flag: calling again is the refresh.
+ *
+ * **Never render a download affordance from this.** When `available` is false
+ * the UI shows `missing`, the `remedies` verbatim and a Browse control;
+ * fetching and executing an ~80MB binary is out of bounds (M4 §1).
+ */
+export async function recordAvailability(): Promise<FfmpegAvailability> {
+  return invoke<FfmpegAvailability>('record_availability');
+}
+
+/**
+ * The recorder's live state, or the resting `idle` value when nothing is being
+ * recorded.
+ *
+ * The catch-up half of `record://status`, exactly as `getPreviewRecord` is for
+ * `preview://show`: the first recording of a session builds the HUD webview,
+ * which is therefore still loading when the first event goes out. Without this
+ * read the first HUD of a session would sit blank.
+ */
+export async function recordingStatus(): Promise<RecordStatus> {
+  return invoke<RecordStatus>('recording_status');
+}
+
+/**
+ * Start recording (M4 §2–§5). Resolves as soon as frames are flowing, with the
+ * opening status — **not** with the finished file.
+ *
+ * Everything after that arrives on events: `record://status` about four times a
+ * second, then `capture://new` and `record://finished` for a recording that was
+ * kept, `record://cancelled` for one that was discarded, and `capture://error`
+ * when it failed. A caller that only wants to know it started can ignore all of
+ * them; a caller that reports the outcome must subscribe, because the promise
+ * has long since resolved by then.
+ *
+ * Rejects when the recording could not start: no ffmpeg, a missing encoder, a
+ * minimized window, an area too small, or one already running.
+ */
+export async function startRecording(spec: RecordSpec): Promise<RecordStatus> {
+  return invoke<RecordStatus>('start_recording', { spec });
+}
+
+/**
+ * Finish the recording in flight and keep the file.
+ *
+ * One of the three routes that must each work when the other two do not — this,
+ * the global stop hotkey and the tray item (M4 §4). It rejects when nothing is
+ * recording, which is a real answer rather than a fault: all three routes can be
+ * a moment behind a recording that has just ended, so treat that rejection as
+ * "already stopped" rather than raising it at the user.
+ */
+export async function stopRecording(): Promise<void> {
+  await invoke<void>('stop_recording');
+}
+
+/**
+ * Finish the recording in flight and discard it. Nothing is written and nothing
+ * lands in history; the ending arrives on `record://cancelled`.
+ *
+ * Same "rejects when idle" contract as `stopRecording`.
+ */
+export async function cancelRecording(): Promise<void> {
+  await invoke<void>('cancel_recording');
+}
+
+/**
+ * The HUD webview taking its own window off screen.
+ *
+ * Rust hides it on every ending, so this is not the normal path — it is the
+ * backstop for the one state Rust cannot see: the window is visible and nothing
+ * is recording. That window is always-on-top, borderless, `skip_taskbar` and
+ * unfocusable, so a stranded one has no titlebar to close, no taskbar entry to
+ * right-click and no way in with the keyboard. Hiding it from here is strictly
+ * better than leaving it up.
+ *
+ * Only ever call it after confirming with `recordingStatus()` that nothing is
+ * active: hiding the HUD out from under a live recording would leave a capture
+ * running with nothing on screen saying so, which is the failure this window
+ * exists to prevent.
+ */
+export async function hideRecorderWindow(): Promise<void> {
+  await getCurrentWindow().hide();
 }
 
 /* ------------------------------------------------------------------ region */
@@ -630,6 +757,40 @@ export function onPreviewHidden(cb: () => void): Promise<UnlistenFn> {
  */
 export function onScrollProgress(cb: (progress: ScrollProgress) => void): Promise<UnlistenFn> {
   return listen<ScrollProgress>('scroll://progress', (e) => cb(e.payload));
+}
+
+/**
+ * The recorder's whole state, and the only event the HUD needs (M4 §4). Emitted
+ * to **every** window — on start, about four times a second while a recording
+ * runs, and once more as the resting `idle` value when it ends.
+ *
+ * That last emit is what takes the HUD's content down; Rust hides the window
+ * itself on every ending, so nothing here is load-bearing for the window's
+ * visibility. `elapsedMs` is the authority for the clock — a consumer may
+ * interpolate between events so the seconds tick smoothly, but it must not keep
+ * counting past an `idle`.
+ */
+export function onRecordStatus(cb: (status: RecordStatus) => void): Promise<UnlistenFn> {
+  return listen<RecordStatus>('record://status', (e) => cb(e.payload));
+}
+
+/**
+ * A recording was kept: the file is written, thumbnailed and in history. The
+ * record itself also arrives on `capture://new`, which the history store adopts,
+ * so this exists for the part that is not the record — the frame counts, and
+ * `truncated`, which says ffmpeg had to be killed and the clip may be short.
+ */
+export function onRecordFinished(cb: (outcome: RecordOutcome) => void): Promise<UnlistenFn> {
+  return listen<RecordOutcome>('record://finished', (e) => cb(e.payload));
+}
+
+/**
+ * A recording was discarded, by the HUD's Cancel or the same command elsewhere.
+ * `record` is `null` — a cancel by definition kept nothing — so this is not a
+ * failure and must not be reported as one.
+ */
+export function onRecordCancelled(cb: (outcome: RecordOutcome) => void): Promise<UnlistenFn> {
+  return listen<RecordOutcome>('record://cancelled', (e) => cb(e.payload));
 }
 
 export function onCaptureError(cb: (message: string) => void): Promise<UnlistenFn> {

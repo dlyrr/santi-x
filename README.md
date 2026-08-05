@@ -24,7 +24,7 @@ reimplementation of the parts that matter, in Rust + Svelte.
 | **M5** | OCR, scrolling capture, smart eraser | ✅ done |
 | **M2.7** | ShareX's own layout for the `sharex` theme | ✅ done |
 | **M3** | Upload destinations (Imgur, `.sxcu`, FTP/FTPS) | ✅ done |
-| M4 | Screen recording (MP4/GIF) | planned |
+| **M4** | Screen recording (MP4/GIF) | ✅ done — window and display sources; **region is not wired up yet** |
 | M6 | Workflows — chaining capture → action → destination | planned |
 
 M5 was scoped as "OCR, scrolling capture, workflows" and shipped the first two
@@ -240,6 +240,121 @@ transfer that had already completed when you pressed it; that is reported as the
 upload it was, with its link, rather than as a cancellation that leaves an
 orphan on the server.
 
+### M4 — screen recording
+
+Record a **window** or a **display** to MP4 or GIF from **Capture › Screen
+recorder**. Recording is one of the three ways a capture can be started that
+also has to be *stopped*, so most of what follows is about that.
+
+#### ffmpeg is found, never downloaded
+
+santi.sharex does not fetch an ffmpeg build. It looks for one, in this order, and
+uses the first that answers `-version`:
+
+1. the path you set in **Settings › Screen recording**
+2. `ffmpeg` on `PATH`
+3. `%USERPROFILE%\scoop\shims\ffmpeg.exe`
+4. `%LOCALAPPDATA%\Microsoft\WinGet\Links\ffmpeg.exe`, then
+   `%ProgramFiles%\ffmpeg\bin\ffmpeg.exe`
+
+If none of them resolves, recording is **disabled with the reason on screen** —
+what is missing, everywhere it looked, and `scoop install ffmpeg` /
+`winget install ffmpeg` to paste — plus a Browse control to point at a binary
+directly. It never offers to download one: fetching and executing an ~80 MB
+unsigned third-party binary sits badly beside the promise two sections up that
+nothing arrives on or leaves this machine unasked.
+
+The encoders a recording needs are checked in the same breath as the binary, so
+a minimal ffmpeg build is reported *before* a run rather than three minutes into
+one that then produces nothing.
+
+#### Three ways to stop, and they are independent
+
+**A recording you cannot stop is the worst thing this feature could do**, so
+there are three routes and each works when the other two do not:
+
+- the **Stop** button on the recording HUD
+- the **global stop hotkey**, `Ctrl+Shift+4` by default — the one that works
+  while you are inside the thing you are recording, because the HUD cannot take
+  focus. The HUD prints it, and prints *"No stop hotkey — use the tray"* instead
+  when nothing managed to claim the combination
+- the tray's **Stop recording** item, enabled for exactly as long as there is
+  something to stop
+
+All three do the same trivial thing — set a flag — and the capture loop comes
+down before anything starts negotiating with ffmpeg. So a wedged encoder can
+cost the tail of a recording; it can never cost the ability to stop one.
+Whatever was encoded is kept, and if ffmpeg had to be killed the recording says
+so rather than looking like a clean one. **Cancel** genuinely discards: no file,
+no history entry.
+
+Pressing stop twice is fine. A second press inside about a second is treated as
+the same press; later than that it is taken as "I mean it" and shortens ffmpeg's
+remaining deadlines — but never to zero, because an MP4 killed before it writes
+its index is a file that will not open.
+
+#### The rect is fixed when the recording starts
+
+A window that **moves or resizes mid-recording keeps the rect it had**. The
+recording is a crop out of one display's duplication at a fixed size, and raw
+video has no way to say a frame changed shape mid-stream — so the alternative is
+not "track it", it is "restart the encoder", which is a different feature. Move a
+window mid-recording and you will record whatever is now in that rectangle.
+
+For the same reason a window that is closed mid-recording leaves you recording
+the desktop behind it. If the **display** being recorded goes away — unplugged,
+mode changed, session switched — the recording ends itself, keeps what it had,
+and says why.
+
+#### The HUD is not in the video
+
+The HUD is placed out of the recorded rect: bottom-right of the display, then
+its other corners, then **another display** — which is the case that matters,
+because recording a whole display puts every one of its own corners inside the
+shot. On a single-display machine recording that whole display there is nowhere
+clear — and *only* then the HUD is marked `WDA_EXCLUDEFROMCAPTURE`, the Windows
+flag whose documented purpose is exactly "windows that show video recording
+controls, so that the controls are not included in the capture". It needs
+Windows 10 2004 or later; if it is refused, the HUD may appear in a full-screen
+recording. Every other recording keeps the HUD out of the shot by position
+alone, which cannot go wrong.
+
+#### Dropped frames are expected
+
+If the encoder cannot keep up, frames are **dropped rather than queued** — the
+queue has a hard ceiling in bytes, so recording a 4K display cannot quietly
+reserve a gigabyte — and the count is shown live on the HUD and reported when
+the recording ends. A tool that silently eats RAM until it dies is worse than one
+that admits it dropped 4% of frames.
+
+Note what is *not* counted: a 144 Hz desktop recorded at 30 fps is downsampled,
+not lossy. Only frames the encoder could not be handed are reported.
+
+#### Formats
+
+- **MP4** — `libx264`, `-crf 23`, `-preset veryfast`, `yuv420p` and `+faststart`.
+  Hardware encoding (`h264_nvenc`) is offered when your ffmpeg has it but is
+  **off by default**: NVENC quality at low bitrates is worse, and "my recordings
+  look soft" is a much harder problem to diagnose than "encoding is slow".
+- **GIF** — genuinely two-pass (`palettegen` then `paletteuse`); a one-pass GIF
+  is a dithered mess. Defaults to 15 fps and a 800px width ceiling, both
+  configurable, because a 4K 30 fps GIF is a several-hundred-megabyte file nobody
+  wants. The live half writes a visually-lossless intermediate first, because
+  both palette passes have to read the same footage and a pipe cannot be read
+  twice.
+
+#### A recording in History is a video, and is treated as one
+
+It plays in a `<video>` in the lightbox (a GIF animates in an `<img>` — it is an
+image as far as the webview is concerned). The editor refuses it with a sentence
+rather than opening on a broken canvas, **Extract text** is not offered at all,
+and Copy is not offered because Windows has no clipboard format for a video that
+anything useful would paste. Upload is offered only where the active destination
+will actually take the format.
+
+Recordings are **never** auto-uploaded, even with auto-upload on: that switch was
+written for screenshots, and a recording can be two orders of magnitude larger.
+
 ## How santi.sharex binds hotkeys — and what its keyboard hook does
 
 Read this. It is the one part of santi.sharex that touches your keyboard
@@ -291,6 +406,7 @@ is not, and the difference is disclosure and scope — hence this section.
 | Region | `Ctrl+Shift+1` |
 | Fullscreen | `Ctrl+Shift+2` |
 | Active window | `Ctrl+Shift+3` |
+| Stop recording | `Ctrl+Shift+4` |
 
 Deliberately boring, deliberately free: a fresh install works without a trip to
 Settings. The hook makes `Win+Shift+S` and `PrintScreen` *bindable* if you want
@@ -322,8 +438,8 @@ the home directory, and installs `node_modules` outside the project.
 ## Architecture
 
 `docs/ARCHITECTURE.md` (M1), `docs/ARCHITECTURE-M2.md` (M2), the
-`docs/ARCHITECTURE-M2.x.md` series, `docs/ARCHITECTURE-M3.md` and
-`docs/ARCHITECTURE-M5.md` are the binding contracts — exact command names, type
+`docs/ARCHITECTURE-M2.x.md` series, `docs/ARCHITECTURE-M3.md`,
+`docs/ARCHITECTURE-M4.md` and `docs/ARCHITECTURE-M5.md` are the binding contracts — exact command names, type
 shapes, event names, and design tokens. Read them before changing anything that
 crosses the Rust/TypeScript seam.
 
@@ -350,6 +466,12 @@ Two things in there are load-bearing and easy to "fix" back into bugs:
 
 Untested at runtime, in rough order of likelihood:
 
+0. **No recording has ever been made on this machine.** The whole of M4 is
+   unit-tested around ffmpeg and the capture loop but has never run end to end.
+   Start with a **short MP4 of a single window**, stop it with the tray item, and
+   check the file opens — that exercises the spawn, the frame pipe, the stop path
+   and the trailer in one go. GIF is the slower and more fragile of the two
+   formats; try it second.
 1. **Uploading has never met a real server from this machine.** The Imgur
    request, the `.sxcu` request and the FTP session are all unit-tested around
    the network but not through it. The most likely first failure is an FTPS

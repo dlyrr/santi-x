@@ -7,6 +7,7 @@ mod migrate;
 mod ocr;
 mod overlay;
 mod preview;
+mod record;
 mod scroll;
 mod store;
 mod upload;
@@ -286,6 +287,8 @@ pub(crate) fn finalize(
         // turned auto-upload on and configured a destination.
         url: None,
         deletion_url: None,
+        // M4 §5. A still has no duration; only `record::publish` fills this in.
+        duration_ms: None,
     };
 
     {
@@ -379,6 +382,10 @@ fn save_settings(app: AppHandle, mut settings: Settings) -> Result<Settings, Str
     // uploading somewhere this build cannot describe: anything that is not a
     // destination santi.sharex implements becomes "none" (M3 §1).
     settings.destination = store::normalize_destination(&settings.destination);
+    // And the last one, for the field where an unrecognised value would mean
+    // handing ffmpeg a container it cannot write: anything that is not a format
+    // M4 implements becomes "mp4" (M4 §6).
+    settings.record_format = store::normalize_record_format(&settings.record_format);
 
     store::persist_settings(&app, &settings)?;
     {
@@ -388,6 +395,9 @@ fn save_settings(app: AppHandle, mut settings: Settings) -> Result<Settings, Str
 
     register_hotkeys(&app, &settings);
     sync_autostart(&app, settings.launch_at_login);
+    // A user who just browsed to a different ffmpeg must not keep running the
+    // one resolved at startup (M4 §1).
+    record::settings_changed();
     // Turning the preview off has to take down the one already on screen, or
     // the setting reads as ignored until it happens to time out.
     if !settings.show_capture_preview {
@@ -571,6 +581,12 @@ pub(crate) enum Action {
     Region,
     Fullscreen,
     ActiveWindow,
+    /// M4 §4. Not a capture at all — it is one of the three independent ways to
+    /// stop a recording, and the only one that works while the user is inside
+    /// the thing they are recording. It goes through this path rather than
+    /// getting its own mechanism so it inherits the plugin-then-hook fallback
+    /// (M2.6 §1) that the capture hotkeys already have.
+    StopRecording,
 }
 
 /// Fire-and-forget: hotkey and tray handlers have nowhere to return an error to,
@@ -580,6 +596,16 @@ pub(crate) enum Action {
 /// do any work inline — `spawn_blocking` returns immediately and the hook
 /// procedure gets to return within microseconds (M2.6 §1).
 pub(crate) fn dispatch(app: &AppHandle, action: Action) {
+    // M4 §4. Stopping does not go through the worker pool: it is a lock and a
+    // store, it must be instant, and — more to the point — it must not be able
+    // to queue behind a capture that is already using the pool. A recording that
+    // cannot be stopped is the worst outcome in this milestone, so the stop path
+    // does not share infrastructure with anything that could be busy.
+    if action == Action::StopRecording {
+        record::request_stop(app);
+        return;
+    }
+
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         // Taking the previous preview off screen is the job of the two functions
@@ -594,6 +620,8 @@ pub(crate) fn dispatch(app: &AppHandle, action: Action) {
             Action::ActiveWindow => {
                 grab(&app, "window", capture::capture_focused_window).map(|_| ())
             }
+            // Handled above, before this thread ever existed.
+            Action::StopRecording => Ok(()),
         };
         if let Err(e) = result {
             let _ = app.emit("capture://error", e);
@@ -623,6 +651,16 @@ fn register_hotkeys(app: &AppHandle, settings: &Settings) {
         ("region", hk.region.as_str(), Action::Region),
         ("fullscreen", hk.fullscreen.as_str(), Action::Fullscreen),
         ("activeWindow", hk.active_window.as_str(), Action::ActiveWindow),
+        // M4 §4. Registered for the whole session rather than only while a
+        // recording runs: a hotkey claimed at the moment the recording starts is
+        // a hotkey that can fail to register at the exact moment it is needed,
+        // and this is the binding that must never not be there. Pressing it when
+        // nothing is recording does nothing.
+        (
+            record::STOP_HOTKEY_ACTION,
+            settings.record_stop_hotkey.as_str(),
+            Action::StopRecording,
+        ),
     ];
 
     let mut statuses: Vec<HotkeyStatus> = Vec::with_capacity(bindings.len());
@@ -753,13 +791,36 @@ fn build_tray_inner(app: &AppHandle, icon: tauri::image::Image<'_>) -> tauri::Re
         None::<&str>,
     )?;
     let separator = PredefinedMenuItem::separator(app)?;
+    // M4 §4's third stop path. Built disabled — it is enabled by `record` for
+    // exactly as long as there is something to stop, so the tray never offers an
+    // action that would do nothing. It is the path that still works when the HUD
+    // never appeared and the stop hotkey could not be registered, which is
+    // precisely when a user goes looking in the tray.
+    let stop_recording = MenuItem::with_id(
+        app,
+        "tray:stopRecording",
+        "Stop recording",
+        false,
+        None::<&str>,
+    )?;
+    let separator_two = PredefinedMenuItem::separator(app)?;
     let show = MenuItem::with_id(app, "tray:show", "Show santi.sharex", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "tray:quit", "Quit", true, None::<&str>)?;
 
     let menu = Menu::with_items(
         app,
-        &[&region, &fullscreen, &active, &separator, &show, &quit],
+        &[
+            &region,
+            &fullscreen,
+            &active,
+            &separator,
+            &stop_recording,
+            &separator_two,
+            &show,
+            &quit,
+        ],
     )?;
+    record::adopt_tray_stop(stop_recording);
 
     let builder = TrayIconBuilder::with_id("santi-sharex")
         .icon(icon)
@@ -771,6 +832,7 @@ fn build_tray_inner(app: &AppHandle, icon: tauri::image::Image<'_>) -> tauri::Re
             "tray:region" => dispatch(app, Action::Region),
             "tray:fullscreen" => dispatch(app, Action::Fullscreen),
             "tray:window" => dispatch(app, Action::ActiveWindow),
+            "tray:stopRecording" => record::request_stop(app),
             "tray:show" => show_main(app),
             "tray:quit" => app.exit(0),
             _ => {}
@@ -828,6 +890,7 @@ pub fn run() {
             app.manage(preview::PreviewState::default());
             app.manage(scroll::ScrollState::default());
             app.manage(upload::UploadState::default());
+            app.manage(record::RecordState::default());
 
             // santi.sharex starts to tray, so the tray icon is the *only* way in. A
             // tray that failed to build would leave the user with no icon and
@@ -959,6 +1022,14 @@ pub fn run() {
             upload::clear_destination_secret,
             upload::destination_status,
             upload::import_custom_uploader,
+            // M4. `stop_recording` and `cancel_recording` are deliberately
+            // synchronous: they set a flag and return, so neither can queue
+            // behind a busy worker pool.
+            record::record_availability,
+            record::recording_status,
+            record::start_recording,
+            record::stop_recording,
+            record::cancel_recording,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -970,6 +1041,13 @@ pub fn run() {
     app.run(|handle, event| {
         if let RunEvent::Exit = event {
             hotkeys::uninstall();
+            // M4 §4. The recording HUD follows the preview's rule — always-on-top,
+            // borderless, unfocusable, so every path ends with it hidden. A
+            // teardown that stalled with it up would leave a sticker the user
+            // cannot click away. Stopping the recording itself is not attempted
+            // here: the process is going, and ffmpeg sees the frame pipe close
+            // and finalizes what it has.
+            record::hide_hud(handle);
             // The last rung of the preview's every-path-ends-hidden ladder
             // (M2.9 §3). It is always-on-top, borderless and unfocusable, so a
             // teardown that stalls with it still up is a sticker the user
