@@ -27,6 +27,7 @@
   import CaptureView from "$lib/views/CaptureView.svelte";
   import DestinationsView from "$lib/views/DestinationsView.svelte";
   import HistoryView from "$lib/views/HistoryView.svelte";
+  import WorkflowsView from "$lib/views/WorkflowsView.svelte";
   import SettingsView from "$lib/views/SettingsView.svelte";
   import { settings } from "$lib/stores/settings.svelte";
   import { history } from "$lib/stores/history.svelte";
@@ -269,14 +270,11 @@
         }
       },
       {
-        kind: "soon",
+        kind: "pane",
         label: "Workflows",
         icon: "workflow",
         ink: SHAREX_ICON_INK.workflows,
-        // M5 shipped OCR and scrolling capture; workflows did not make it, so
-        // this cannot keep pointing at a milestone that is already done.
-        milestone: "M6",
-        note: "Chaining capture → action → destination arrives in M6."
+        pane: "workflows"
       },
       { kind: "pane", label: "Tools", icon: "wrench", ink: SHAREX_ICON_INK.tools, pane: "tools" }
     ],
@@ -496,6 +494,8 @@
       <!-- This shell has its own Destinations row, so Settings does not repeat
            the form: one screen owns it, and the menu says which. -->
       <SettingsView showDestinations={false} />
+    {:else if pane === "workflows"}
+      <WorkflowsView />
     {:else if pane === "destinations"}
       <DestinationsView />
     {:else if pane === "tools"}

@@ -73,14 +73,26 @@ pub async fn save_edit(
         let bytes = decode_base64(&png)?;
         let img = decode_png(&bytes)?;
 
-        if replace {
+        let saved = if replace {
             replace_capture(&app, &id, &img, &bytes)
         } else {
             // A new record goes through M1's pipeline unchanged, so "save as
             // new" honours the filename pattern, the clipboard setting and
             // open_folder_after exactly like a fresh capture does.
             crate::finalize(&app, img, "edit")
-        }
+        }?;
+
+        // M6 §2: a workflow's Annotate step is blocked on this. `new_id` is the
+        // record the rest of the chain must carry — on "save as new" the
+        // original still holds the un-annotated image, and uploading that is
+        // the privacy failure the whole wait exists to prevent.
+        crate::workflow::editor_finished(
+            &app,
+            &id,
+            true,
+            (!replace).then(|| saved.id.clone()),
+        );
+        Ok(saved)
     })
     .await
 }
@@ -97,6 +109,12 @@ pub async fn copy_edit(app: AppHandle, png: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn close_editor(app: AppHandle) -> Result<(), String> {
     run_blocking(move || {
+        // Closing without saving is a cancel, and a workflow waiting on this
+        // editor has to hear it as one — it ends the chain rather than carrying
+        // an un-annotated image on to the destination. Sent before the window
+        // goes, so the `Destroyed` handler's grace timer never has to fire.
+        crate::workflow::editor_cancelled(&app);
+
         if let Some(window) = app.get_webview_window(EDITOR_LABEL) {
             // `destroy`, not `close`: the caller has already decided (and, if the
             // document was dirty, already asked). `close` would come back round

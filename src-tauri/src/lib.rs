@@ -11,6 +11,7 @@ mod record;
 mod scroll;
 mod store;
 mod upload;
+mod workflow;
 
 use std::fs;
 use std::path::Path;
@@ -300,6 +301,12 @@ pub(crate) fn finalize(
 
     let _ = app.emit("capture://new", record.clone());
 
+    // M6 §2: the capture step's completion signal. Every commit path in the app
+    // ends here and no cancel path does, which is exactly the property the
+    // runner needs — a cancelled region selection must end the workflow
+    // cleanly rather than hand it a capture that never happened.
+    workflow::capture_landed(app, &record);
+
     // M3 §1. The one implicit upload path in the app, and it is inert unless
     // `auto_upload` is on *and* a destination is configured — neither of which
     // is true out of the box. It hands the transfer to its own worker, so a
@@ -587,6 +594,11 @@ pub(crate) enum Action {
     /// getting its own mechanism so it inherits the plugin-then-hook fallback
     /// (M2.6 §1) that the capture hotkeys already have.
     StopRecording,
+    /// M6 §3. Runs the workflow that owns this slot. Carries a slot rather than
+    /// an id so the payload stays `Copy` for the shortcut closures, and because
+    /// slots are rebuilt on every registration pass — a stale one names nothing
+    /// and is ignored, rather than running a workflow the user just edited.
+    Workflow(u64),
 }
 
 /// Fire-and-forget: hotkey and tray handlers have nowhere to return an error to,
@@ -613,6 +625,7 @@ pub(crate) fn dispatch(app: &AppHandle, action: Action) {
         // both of them without coming through here. Doing it a third time on
         // this path would only hide an already-hidden window.
         let result = match action {
+            Action::Workflow(slot) => workflow::start_by_slot(&app, slot),
             Action::Region => overlay::start_region_blocking(&app),
             Action::Fullscreen => {
                 grab(&app, "fullscreen", capture::capture_virtual_desktop).map(|_| ())
@@ -637,6 +650,28 @@ pub(crate) fn dispatch(app: &AppHandle, action: Action) {
 /// already owns, which `RegisterHotKey` can never take. A binding that neither
 /// mechanism can claim is reported and skipped — it must never stop the others
 /// from working or abort startup.
+/// The combos the app itself claims, as (human label, accelerator).
+///
+/// M6 §3: workflow hotkeys share one registry with these, so the workflow editor
+/// can refuse a combo at edit time and name what already owns it. Kept next to
+/// [`register_hotkeys`] and derived from the same `Settings` fields, so a binding
+/// added there cannot quietly become invisible to conflict detection.
+///
+/// Blank accelerators are omitted — an unset hotkey claims nothing.
+pub(crate) fn builtin_hotkeys(settings: &Settings) -> Vec<(&'static str, String)> {
+    let hk = &settings.hotkeys;
+    [
+        ("Capture region", hk.region.as_str()),
+        ("Capture entire screen", hk.fullscreen.as_str()),
+        ("Capture active window", hk.active_window.as_str()),
+        ("Stop recording", settings.record_stop_hotkey.as_str()),
+    ]
+    .into_iter()
+    .filter(|(_, accelerator)| !accelerator.trim().is_empty())
+    .map(|(label, accelerator)| (label, accelerator.to_string()))
+    .collect()
+}
+
 fn register_hotkeys(app: &AppHandle, settings: &Settings) {
     let shortcuts = app.global_shortcut();
     if let Err(e) = shortcuts.unregister_all() {
@@ -647,21 +682,33 @@ fn register_hotkeys(app: &AppHandle, settings: &Settings) {
     hotkeys::uninstall();
 
     let hk = &settings.hotkeys;
-    let bindings = [
-        ("region", hk.region.as_str(), Action::Region),
-        ("fullscreen", hk.fullscreen.as_str(), Action::Fullscreen),
-        ("activeWindow", hk.active_window.as_str(), Action::ActiveWindow),
+    let mut bindings: Vec<(String, String, Action)> = vec![
+        ("region".into(), hk.region.clone(), Action::Region),
+        ("fullscreen".into(), hk.fullscreen.clone(), Action::Fullscreen),
+        ("activeWindow".into(), hk.active_window.clone(), Action::ActiveWindow),
         // M4 §4. Registered for the whole session rather than only while a
         // recording runs: a hotkey claimed at the moment the recording starts is
         // a hotkey that can fail to register at the exact moment it is needed,
         // and this is the binding that must never not be there. Pressing it when
         // nothing is recording does nothing.
         (
-            record::STOP_HOTKEY_ACTION,
-            settings.record_stop_hotkey.as_str(),
+            record::STOP_HOTKEY_ACTION.into(),
+            settings.record_stop_hotkey.clone(),
             Action::StopRecording,
         ),
     ];
+
+    // M6 §3: workflow hotkeys share this one registry with the built-ins, so
+    // they inherit the plugin-then-hook fallback and appear in the same status
+    // list the UI renders. Rebuilt every pass, which is also what unregisters a
+    // workflow the user just disabled or deleted.
+    for binding in workflow::hotkey_bindings(app) {
+        bindings.push((
+            binding.action_id,
+            binding.accelerator,
+            Action::Workflow(binding.slot),
+        ));
+    }
 
     let mut statuses: Vec<HotkeyStatus> = Vec::with_capacity(bindings.len());
     let mut fallback: Vec<(hotkeys::Combo, Action)> = Vec::new();
@@ -891,6 +938,25 @@ pub fn run() {
             app.manage(scroll::ScrollState::default());
             app.manage(upload::UploadState::default());
             app.manage(record::RecordState::default());
+            // Reads workflows.json here rather than lazily: a parse failure has
+            // to be known before the first hotkey registration, or a workflow
+            // this build cannot read would silently claim no combo.
+            app.manage(workflow::WorkflowState::new(&handle));
+            // Listeners up before anything can trigger a workflow: one attached
+            // when a step starts is one that can miss that step's answer.
+            workflow::init(&handle);
+
+            // A workflows.json this build cannot parse loads as an empty list,
+            // which on its own is indistinguishable from having no workflows —
+            // so say so. The file is set aside rather than overwritten on the
+            // next save (store::quarantine_workflows), and that is worth telling
+            // the user before they rebuild everything from scratch.
+            if let Some(e) = workflow::load_error(&handle) {
+                report_startup_error(
+                    &handle,
+                    format!("Your workflows could not be read, so none are loaded: {e}"),
+                );
+            }
 
             // santi.sharex starts to tray, so the tray icon is the *only* way in. A
             // tray that failed to build would leave the user with no icon and
@@ -975,6 +1041,14 @@ pub fn run() {
             WindowEvent::Destroyed if window.label() == overlay::OVERLAY_LABEL => {
                 restore_main_after_capture(window.app_handle());
             }
+            // M6 §2. The editor going away by any route — its X, Alt+F4, a
+            // webview crash — has to reach a workflow waiting on it, or an
+            // Annotate step waits forever. Counted as a cancel unless a save
+            // already answered, so closing the editor ends the chain instead of
+            // carrying the un-annotated image on to the destination.
+            WindowEvent::Destroyed if window.label() == editor::EDITOR_LABEL => {
+                workflow::editor_window_closed(window.app_handle());
+            }
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
@@ -1022,6 +1096,14 @@ pub fn run() {
             upload::clear_destination_secret,
             upload::destination_status,
             upload::import_custom_uploader,
+            workflow::get_workflows,
+            workflow::validate_workflow,
+            workflow::save_workflow,
+            workflow::delete_workflow,
+            workflow::set_workflow_enabled,
+            workflow::run_workflow,
+            workflow::cancel_workflow,
+            workflow::workflow_status,
             // M4. `stop_recording` and `cancel_recording` are deliberately
             // synchronous: they set a flag and return, so neither can queue
             // behind a busy worker pool.

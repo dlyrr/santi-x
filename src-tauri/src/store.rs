@@ -603,6 +603,63 @@ fn history_path(app: &AppHandle) -> PathBuf {
     app_data(app).join("history.json")
 }
 
+fn workflows_path(app: &AppHandle) -> PathBuf {
+    app_data(app).join("workflows.json")
+}
+
+// ---------------------------------------------------------------------------
+// Workflow persistence (M6 §1)
+// ---------------------------------------------------------------------------
+
+/// Workflows live in their own file, deliberately — a `workflows.json` this
+/// build cannot parse must not cost the user their hotkeys and save directory,
+/// which is exactly what would happen if they shared `settings.json`.
+///
+/// A missing file is an empty list and not an error: that is a fresh install.
+/// A file that exists but will not parse IS an error, returned rather than
+/// swallowed, because the caller has to know not to overwrite it — see
+/// [`quarantine_workflows`].
+pub fn load_workflows(app: &AppHandle) -> Result<Vec<crate::workflow::Workflow>, String> {
+    let path = workflows_path(app);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("could not read workflows.json: {e}")),
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&raw).map_err(|e| format!("workflows.json could not be parsed: {e}"))
+}
+
+pub fn persist_workflows(
+    app: &AppHandle,
+    workflows: &[crate::workflow::Workflow],
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(workflows)
+        .map_err(|e| format!("failed to serialize workflows: {e}"))?;
+    fs::write(workflows_path(app), json)
+        .map_err(|e| format!("failed to write workflows.json: {e}"))
+}
+
+/// Move an unparseable `workflows.json` aside before the first write over it.
+///
+/// It is the user's only copy of workflows this build could not read, and "your
+/// workflows are gone" is a far worse outcome than a stray `.bad` file sitting
+/// next to `settings.json`. Best-effort by design: failing to rename must not
+/// stop the app from saving the workflows the user has now.
+pub fn quarantine_workflows(app: &AppHandle) {
+    let path = workflows_path(app);
+    if !path.exists() {
+        return;
+    }
+    let stamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let aside = app_data(app).join(format!("workflows.bad-{stamp}.json"));
+    if let Err(e) = fs::rename(&path, &aside) {
+        eprintln!("santi.sharex: could not set aside the unreadable workflows.json: {e}");
+    }
+}
+
 /// `app_data_dir()/thumbs`, created if absent.
 pub fn thumbs_dir(app: &AppHandle) -> PathBuf {
     let dir = app_data(app).join("thumbs");

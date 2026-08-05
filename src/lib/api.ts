@@ -29,7 +29,11 @@ import type {
   UploadDone,
   UploadError,
   UploadProgress,
-  WindowInfo
+  WindowInfo,
+  Workflow,
+  WorkflowDone,
+  WorkflowError,
+  WorkflowProgress
 } from '$lib/types';
 
 /**
@@ -39,6 +43,7 @@ import type {
  */
 export type {
   ArmPayload,
+  BuiltinHotkeyAction,
   CaptureKind,
   CaptureRecord,
   CustomUploaderSettings,
@@ -77,9 +82,25 @@ export type {
   UploadProgress,
   View,
   WindowInfo,
-  WindowRect
+  WindowRect,
+  Workflow,
+  WorkflowAction,
+  WorkflowActionKind,
+  WorkflowCapture,
+  WorkflowCaptureKind,
+  WorkflowChainLine,
+  WorkflowChainSegment,
+  WorkflowContext,
+  WorkflowDone,
+  WorkflowError,
+  WorkflowIssue,
+  WorkflowProgress,
+  WorkflowTrigger
 } from '$lib/types';
 export {
+  acceleratorFromEvent,
+  BUILTIN_HOTKEY_ACTIONS,
+  BUILTIN_HOTKEY_OWNER,
   canUploadNow,
   captureExtension,
   captureIsRecording,
@@ -88,6 +109,7 @@ export {
   DESTINATION_KINDS,
   DESTINATION_LABEL,
   destinationAcceptsCapture,
+  displayAccelerator,
   EMPTY_CUSTOM_UPLOADER,
   FFMPEG_REMEDY_BROWSE,
   FFMPEG_SOURCE_LABEL,
@@ -99,6 +121,7 @@ export {
   isDestinationKind,
   isRecordFormat,
   isScrollStopReason,
+  normalizeAccelerator,
   RECORD_FORMAT_LABEL,
   RECORD_FORMATS,
   RECORD_FPS,
@@ -108,10 +131,32 @@ export {
   RECORD_SOURCES,
   RECORD_STOP_HOTKEY_DEFAULT,
   recordFormatOf,
+  sameAccelerator,
   SCROLL_DELAY_MS,
   SCROLL_MAX_FRAMES,
   SCROLL_STEP,
-  THEME_STORAGE_KEY
+  THEME_STORAGE_KEY,
+  WORKFLOW_ACTION_HELP,
+  WORKFLOW_ACTION_KINDS,
+  WORKFLOW_ACTION_LABEL,
+  WORKFLOW_ACTION_NAME,
+  WORKFLOW_CAPTURE_KINDS,
+  WORKFLOW_CAPTURE_LABEL,
+  WORKFLOW_CAPTURE_NAME,
+  WORKFLOW_CHAIN_ARROW,
+  WORKFLOW_HOTKEY_PREFIX,
+  workflowActionSummary,
+  workflowCanEnable,
+  workflowCanSave,
+  workflowCaptureSummary,
+  workflowChain,
+  workflowChainLine,
+  workflowDestinationOf,
+  workflowHotkeyAction,
+  workflowIdOfHotkeyAction,
+  workflowIssues,
+  workflowStepLabel,
+  workflowUploads
 } from '$lib/types';
 
 /* ------------------------------------------------------------------ errors */
@@ -666,6 +711,65 @@ export async function cancelUpload(id: string): Promise<void> {
   await invoke<void>('cancel_upload', { id });
 }
 
+/* --------------------------------------------------------------- workflows */
+
+/**
+ * Every workflow, in the order the user arranged them (M6 §1).
+ *
+ * They live in `workflows.json` beside `settings.json` rather than inside it, so
+ * this is its own read: a corrupt workflow costs the user their workflows and
+ * nothing else.
+ */
+export async function getWorkflows(): Promise<Workflow[]> {
+  return invoke<Workflow[]>('get_workflows');
+}
+
+/**
+ * Write the whole list back and re-register the workflow hotkeys through the
+ * existing M2.6 path (M6 §3). Resolves with the list as stored — adopt the
+ * return value rather than the draft, the same way `saveSettings` is used.
+ *
+ * The whole list, not one workflow: reordering, deleting and editing are then
+ * the same operation, and there is no window in which the file disagrees with
+ * what the hotkey registry was built from.
+ *
+ * Rust also emits `workflows://changed`, so a view listening for that needs
+ * nothing from the return value.
+ */
+export async function saveWorkflows(workflows: Workflow[]): Promise<Workflow[]> {
+  return invoke<Workflow[]>('save_workflows', { workflows });
+}
+
+/**
+ * Run one workflow now, exactly as its hotkey would (M6 §2).
+ *
+ * Resolves as soon as the run has **started**, not when it finishes: everything
+ * after that arrives on `workflow://progress` and then one of
+ * `workflow://done` / `workflow://error`. Subscribe before calling, or a chain
+ * that opens the overlay and waits looks like a button that did nothing.
+ *
+ * Rejects when the run could not start — most often because one is already
+ * running. Workflows are sequential and never concurrent: two overlapping region
+ * overlays is a lockout, so a second trigger is refused rather than queued, and
+ * that rejection is a toast rather than a failure.
+ */
+export async function runWorkflow(id: string): Promise<void> {
+  await invoke<void>('run_workflow', { id });
+}
+
+/**
+ * Stop the run in flight at whatever step it reached (M6 §2).
+ *
+ * Cancelling is possible at every step and never leaves the overlay, the editor
+ * or the recorder HUD on screen. Infallible, and a no-op when nothing is
+ * running — the UI is often a moment behind a chain that has just ended, and
+ * that is not an error. The ending still arrives on `workflow://done` with
+ * `cancelled: true`.
+ */
+export async function cancelWorkflow(): Promise<void> {
+  await invoke<void>('cancel_workflow');
+}
+
 /* ------------------------------------------------------------------ events */
 
 export function onCaptureNew(cb: (record: CaptureRecord) => void): Promise<UnlistenFn> {
@@ -846,6 +950,42 @@ export function onUploadDone(cb: (done: UploadDone) => void): Promise<UnlistenFn
  */
 export function onUploadError(cb: (error: UploadError) => void): Promise<UnlistenFn> {
   return listen<UploadError>('upload://error', (e) => cb(e.payload));
+}
+
+/**
+ * The workflow list changed — saved from this window, or from another one.
+ * The payload is the complete list, so replace the local one rather than
+ * merging into it, exactly as `hotkeys://status` is used.
+ */
+export function onWorkflowsChanged(cb: (workflows: Workflow[]) => void): Promise<UnlistenFn> {
+  return listen<Workflow[]>('workflows://changed', (e) => cb(e.payload));
+}
+
+/**
+ * A workflow run moved on to another step (M6 §2). Emitted to every window, and
+ * for every step — a chain that runs silently for eight seconds looks broken,
+ * so this is what the progress readout and its Cancel are built from.
+ */
+export function onWorkflowProgress(cb: (progress: WorkflowProgress) => void): Promise<UnlistenFn> {
+  return listen<WorkflowProgress>('workflow://progress', (e) => cb(e.payload));
+}
+
+/**
+ * A run ended without failing. `cancelled` distinguishes "it did everything"
+ * from "the user backed out of the region overlay or the editor", which is a
+ * clean ending and must not be reported as a failure.
+ */
+export function onWorkflowDone(cb: (done: WorkflowDone) => void): Promise<UnlistenFn> {
+  return listen<WorkflowDone>('workflow://done', (e) => cb(e.payload));
+}
+
+/**
+ * A step failed and the chain stopped there. `step` names which one; show it
+ * with the message, because "workflow failed" leaves the user guessing whether
+ * their capture was taken, saved, or sent.
+ */
+export function onWorkflowError(cb: (error: WorkflowError) => void): Promise<UnlistenFn> {
+  return listen<WorkflowError>('workflow://error', (e) => cb(e.payload));
 }
 
 export type { UnlistenFn };

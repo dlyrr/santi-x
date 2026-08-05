@@ -6,6 +6,7 @@
   import Toast, { toast } from "$lib/components/Toast.svelte";
   import CaptureView from "$lib/views/CaptureView.svelte";
   import HistoryView from "$lib/views/HistoryView.svelte";
+  import WorkflowsView from "$lib/views/WorkflowsView.svelte";
   import SettingsView from "$lib/views/SettingsView.svelte";
   import RegionOverlay from "$lib/overlay/RegionOverlay.svelte";
   import EditorRoot from "$lib/editor/EditorRoot.svelte";
@@ -111,6 +112,8 @@
         <CaptureView onNavigate={navigate} />
       {:else if view === "history"}
         <HistoryView />
+      {:else if view === "workflows"}
+        <WorkflowsView />
       {:else}
         <SettingsView />
       {/if}

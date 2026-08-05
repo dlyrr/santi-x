@@ -9,6 +9,7 @@
   const items: { id: View; label: string; icon: IconName }[] = [
     { id: "capture", label: "Capture", icon: "camera" },
     { id: "history", label: "History", icon: "clock" },
+    { id: "workflows", label: "Workflows", icon: "workflow" },
     { id: "settings", label: "Settings", icon: "settings" }
   ];
 

@@ -54,7 +54,7 @@ export interface Hotkeys {
 }
 
 /**
- * Everything a hotkey status row can describe.
+ * Everything a hotkey status row can describe that santi.sharex itself owns.
  *
  * The three capture bindings live inside `Settings.hotkeys`; `recordStop` does
  * not — M4 §6 puts it at the top level as `Settings.recordStopHotkey`, because
@@ -65,7 +65,38 @@ export interface Hotkeys {
  * Consumers that only know about the capture three keep working: they look their
  * own key up by name, and a row they have no opinion about is simply not found.
  */
-export type HotkeyAction = keyof Hotkeys | 'recordStop';
+export type BuiltinHotkeyAction = keyof Hotkeys | 'recordStop';
+
+/**
+ * The built-ins in the order every hotkey table lists them, and what each one
+ * is called when something else tries to claim its combination (M6 §3). A
+ * conflict has to name what already owns the combo, and "region" is not a name
+ * a user recognises from the outside.
+ */
+export const BUILTIN_HOTKEY_ACTIONS = [
+  'region',
+  'fullscreen',
+  'activeWindow',
+  'recordStop'
+] as const satisfies readonly BuiltinHotkeyAction[];
+
+export const BUILTIN_HOTKEY_OWNER: Record<BuiltinHotkeyAction, string> = {
+  region: 'Capture region',
+  fullscreen: 'Capture fullscreen',
+  activeWindow: 'Capture active window',
+  recordStop: 'Stop recording'
+};
+
+/**
+ * Which binding a `HotkeyStatus` row describes.
+ *
+ * M6 §3 puts workflow hotkeys through the same M2.6 registry as the built-ins,
+ * so the table stops being three fixed rows: a workflow's binding is reported
+ * as `workflow:<workflow id>`. Nothing may hard-code that prefix —
+ * `workflowHotkeyAction()` and `workflowIdOfHotkeyAction()` below are the only
+ * two places it is spelled out.
+ */
+export type HotkeyAction = BuiltinHotkeyAction | `workflow:${string}`;
 
 /** The shipped stop-recording accelerator (M4 §4). */
 export const RECORD_STOP_HOTKEY_DEFAULT = 'CmdOrCtrl+Shift+4';
@@ -627,8 +658,14 @@ export interface Rect {
   height: number;
 }
 
-/** Top-level navigation inside the `main` window. */
-export type View = 'capture' | 'history' | 'settings';
+/**
+ * Top-level navigation inside the `main` window.
+ *
+ * `workflows` joins the three original entries in M6 §4 — it is a screen of its
+ * own in both shells rather than a section of Settings, because a workflow is a
+ * thing you run, not a preference.
+ */
+export type View = 'capture' | 'history' | 'workflows' | 'settings';
 
 /* -------------------------------------------------------------------- OCR */
 
@@ -1016,4 +1053,687 @@ export interface UploadError {
   id: string;
   message: string;
   cancelled: boolean;
+}
+
+/* ---------------------------------------------------------- accelerators */
+
+/**
+ * Modifier spellings that all mean the same key, folded to the one form
+ * `Settings.hotkeys` is written in.
+ *
+ * `Control` folds into `CmdOrCtrl` because this is a Windows-only app and they
+ * are the same physical key here — a workflow bound to `Control+Shift+1` and
+ * the region hotkey on `CmdOrCtrl+Shift+1` are one combination, and a conflict
+ * check that could not see that would let the user bind a collision the
+ * registry then resolves by silence.
+ */
+const MODIFIER_ALIASES: Record<string, string> = {
+  cmdorctrl: 'CmdOrCtrl',
+  commandorcontrol: 'CmdOrCtrl',
+  ctrl: 'CmdOrCtrl',
+  control: 'CmdOrCtrl',
+  cmd: 'CmdOrCtrl',
+  command: 'CmdOrCtrl',
+  alt: 'Alt',
+  option: 'Alt',
+  shift: 'Shift',
+  super: 'Super',
+  meta: 'Super',
+  win: 'Super'
+};
+
+/** Tauri writes modifiers in this order; so does anything built here. */
+const MODIFIER_ORDER = ['CmdOrCtrl', 'Alt', 'Shift', 'Super'];
+
+/**
+ * One accelerator in a single canonical spelling, so two that name the same
+ * combination compare equal whichever order or alias they were written in.
+ * `''` for an accelerator with no key in it, which is "not bound to anything"
+ * rather than a combination that matches everything.
+ */
+export function normalizeAccelerator(accel: string | null | undefined): string {
+  const parts = (accel ?? '')
+    .split('+')
+    .map((part) => part.trim())
+    .filter((part) => part !== '');
+  const modifiers = new Set<string>();
+  const keys: string[] = [];
+  for (const part of parts) {
+    const modifier = MODIFIER_ALIASES[part.toLowerCase()];
+    if (modifier) modifiers.add(modifier);
+    else keys.push(part.length === 1 ? part.toUpperCase() : part);
+  }
+  if (keys.length === 0) return '';
+  return [...MODIFIER_ORDER.filter((m) => modifiers.has(m)), ...keys].join('+');
+}
+
+/**
+ * Whether two accelerators are the same combination. An empty one matches
+ * nothing, including another empty one — "unset" is not a collision.
+ */
+export function sameAccelerator(a: string | null | undefined, b: string | null | undefined): boolean {
+  const left = normalizeAccelerator(a).toLowerCase();
+  const right = normalizeAccelerator(b).toLowerCase();
+  return left !== '' && left === right;
+}
+
+/**
+ * An accelerator split into the parts a row of `<kbd>` renders, in the words
+ * printed on a Windows keyboard rather than Tauri's.
+ */
+export function displayAccelerator(accel: string | null | undefined): string[] {
+  if (!accel) return ['Not set'];
+  return accel
+    .split('+')
+    .map((part) => part.trim())
+    .filter((part) => part !== '')
+    .map((part) => {
+      if (part === 'CmdOrCtrl' || part === 'CommandOrControl') return 'Ctrl';
+      if (part === 'Super' || part === 'Meta') return 'Win';
+      if (part === 'PrintScreen') return 'Print Screen';
+      return part;
+    });
+}
+
+/**
+ * The physical key a `KeyboardEvent` landed on, as an accelerator base — layout
+ * independent, so a Dvorak or AZERTY user binds the key they pressed rather than
+ * the letter it produced. `null` for a bare modifier, which is not a
+ * combination.
+ */
+function acceleratorKey(code: string, key: string): string | null {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
+  if (/^Numpad[0-9]$/.test(code)) return code;
+  const named = new Set([
+    'PrintScreen',
+    'Space',
+    'Enter',
+    'Tab',
+    'Backspace',
+    'Delete',
+    'Insert',
+    'Home',
+    'End',
+    'PageUp',
+    'PageDown',
+    'ArrowUp',
+    'ArrowDown',
+    'ArrowLeft',
+    'ArrowRight',
+    'Minus',
+    'Equal',
+    'BracketLeft',
+    'BracketRight',
+    'Backslash',
+    'Semicolon',
+    'Quote',
+    'Comma',
+    'Period',
+    'Slash',
+    'Backquote',
+    'CapsLock',
+    'NumLock',
+    'ScrollLock',
+    'Pause'
+  ]);
+  if (named.has(code)) return code;
+  if (key === 'PrintScreen') return 'PrintScreen';
+  return null;
+}
+
+/**
+ * The accelerator a keypress describes, or `null` when it does not describe one.
+ *
+ * Shared by every click-to-record control in the app — Settings' four rows and a
+ * workflow's trigger — so a combination typed in one place is spelled exactly
+ * the way the other would have spelled it. That is what makes the M6 §3 conflict
+ * check able to compare them at all.
+ */
+export function acceleratorFromEvent(event: KeyboardEvent): string | null {
+  const base = acceleratorKey(event.code, event.key);
+  if (!base) return null;
+  const parts: string[] = [];
+  if (event.ctrlKey) parts.push('CmdOrCtrl');
+  if (event.altKey) parts.push('Alt');
+  if (event.shiftKey) parts.push('Shift');
+  if (event.metaKey) parts.push('Super');
+  parts.push(base);
+  return parts.join('+');
+}
+
+/* ------------------------------------------------------------ workflows (M6) */
+
+/**
+ * A workflow chains **capture → actions → destination** and binds the whole
+ * chain to one hotkey (M6 §1).
+ *
+ * Stored in `workflows.json` beside `settings.json`, never inside it — a corrupt
+ * workflow must not cost the user their hotkeys and save directory.
+ *
+ * M6 adds no new capability. Every step below is an existing path called in
+ * order, which is why none of these types describes anything the rest of the app
+ * cannot already do: if a step here needs new plumbing, the step is wrong.
+ */
+export interface Workflow {
+  id: string;
+  name: string;
+  /** Off means the hotkey is unregistered and only Run now reaches it. */
+  enabled: boolean;
+  trigger: WorkflowTrigger;
+  capture: WorkflowCapture;
+  actions: WorkflowAction[];
+  /**
+   * A destination id, or `null` to skip uploading entirely.
+   *
+   * A plain `string` for the same reason `Settings.destination` is: a
+   * hand-edited or future `workflows.json` can name something this build has no
+   * uploader for. Read it through `workflowDestinationOf()`, which answers
+   * `null` for both "no destination" and "a destination this build cannot
+   * reach" — `workflowUploads()` is what tells those two apart, and the
+   * difference matters because the second is an error and the first is a
+   * perfectly ordinary local workflow.
+   */
+  destination: string | null;
+}
+
+/**
+ * All three workflow enums are internally tagged on **`type`**, matching
+ * `#[serde(tag = "type", rename_all = "camelCase")]` — the same arrangement
+ * `RecordSource` already uses, and for the same reason: `kind` is taken by
+ * `CaptureRecord`.
+ */
+export type WorkflowTrigger = { type: 'hotkey'; accelerator: string } | { type: 'manual' };
+
+/**
+ * Which capture path the workflow opens with. Every member names a path the app
+ * already has: `region` arms the pre-warmed overlay and waits for the commit,
+ * `scrolling` is M5 §4's stitcher, `record` is M4's recorder.
+ */
+export type WorkflowCapture =
+  | { type: 'region' }
+  | { type: 'fullscreen' }
+  | { type: 'activeWindow' }
+  | { type: 'monitor'; id: number }
+  | { type: 'window'; id: number }
+  | { type: 'scrolling'; window: number }
+  /** `'mp4'` or `'gif'`, read through `recordFormatOf()` like every other. */
+  | { type: 'record'; format: string };
+
+/**
+ * One step between the capture and the destination, in listed order.
+ *
+ * `annotate` opens the editor and **blocks the rest of the chain** until it is
+ * saved or cancelled (M6 §2). That wait is the whole point of the step: without
+ * it a redaction workflow uploads the un-redacted image, which is a privacy
+ * failure rather than a bug.
+ */
+export type WorkflowAction =
+  | { type: 'annotate' }
+  | { type: 'saveToDisk' }
+  | { type: 'copyImage' }
+  | { type: 'ocr'; copyText: boolean }
+  | { type: 'openFolder' };
+
+export const WORKFLOW_CAPTURE_KINDS = [
+  'region',
+  'fullscreen',
+  'activeWindow',
+  'monitor',
+  'window',
+  'scrolling',
+  'record'
+] as const;
+
+export type WorkflowCaptureKind = (typeof WORKFLOW_CAPTURE_KINDS)[number];
+
+export const WORKFLOW_ACTION_KINDS = [
+  'annotate',
+  'saveToDisk',
+  'copyImage',
+  'ocr',
+  'openFolder'
+] as const;
+
+export type WorkflowActionKind = (typeof WORKFLOW_ACTION_KINDS)[number];
+
+/**
+ * The terse names the chain summary is built from — `Region → Annotate → Save →
+ * Imgur`. Short on purpose: the summary has to fit on one row beside everything
+ * else, and it is the row's most load-bearing text.
+ */
+export const WORKFLOW_CAPTURE_LABEL: Record<WorkflowCaptureKind, string> = {
+  region: 'Region',
+  fullscreen: 'Fullscreen',
+  activeWindow: 'Active window',
+  monitor: 'Monitor',
+  window: 'Window',
+  scrolling: 'Scrolling',
+  record: 'Record'
+};
+
+export const WORKFLOW_ACTION_LABEL: Record<WorkflowActionKind, string> = {
+  annotate: 'Annotate',
+  saveToDisk: 'Save',
+  copyImage: 'Copy',
+  ocr: 'OCR',
+  openFolder: 'Open folder'
+};
+
+/**
+ * The unabbreviated names, for the editor — where there is room to say what a
+ * step does and no reason to make the user expand `OCR` in their head. Kept
+ * apart from the terse set rather than derived from it, because "Save" in a
+ * one-line chain and "Save to disk" in a list of steps are both right.
+ */
+export const WORKFLOW_CAPTURE_NAME: Record<WorkflowCaptureKind, string> = {
+  region: 'Region',
+  fullscreen: 'Fullscreen',
+  activeWindow: 'Active window',
+  monitor: 'Monitor',
+  window: 'Window',
+  scrolling: 'Scrolling capture',
+  record: 'Screen recording'
+};
+
+export const WORKFLOW_ACTION_NAME: Record<WorkflowActionKind, string> = {
+  annotate: 'Annotate',
+  saveToDisk: 'Save to disk',
+  copyImage: 'Copy image',
+  ocr: 'Read text (OCR)',
+  openFolder: 'Open folder'
+};
+
+/** What each step is for, one line, shown where the step is chosen. */
+export const WORKFLOW_ACTION_HELP: Record<WorkflowActionKind, string> = {
+  annotate: 'Open the editor and wait. Nothing after this runs until you save or cancel.',
+  saveToDisk: 'Write the image into the screenshots folder.',
+  copyImage: 'Put the image on the clipboard.',
+  ocr: 'Recognise the text in the image with the offline Windows engine.',
+  openFolder: 'Reveal the file in Explorer.'
+};
+
+/**
+ * A label from one of the maps above, falling back to the raw tag.
+ *
+ * A `workflows.json` written by a future build can carry a step this one has
+ * never heard of. Showing its tag is honest; showing a blank segment in the one
+ * line that says what a workflow does is not.
+ */
+function labelOf(table: Record<string, string>, tag: string): string {
+  return table[tag] ?? tag;
+}
+
+/** The chain summary's first segment, e.g. `Region` or `Record MP4`. */
+export function workflowCaptureSummary(capture: WorkflowCapture): string {
+  if (capture.type === 'record') {
+    return `Record ${RECORD_FORMAT_LABEL[recordFormatOf(capture.format)]}`;
+  }
+  return labelOf(WORKFLOW_CAPTURE_LABEL, capture.type);
+}
+
+export function workflowActionSummary(action: WorkflowAction): string {
+  return labelOf(WORKFLOW_ACTION_LABEL, action.type);
+}
+
+/** Whether this workflow ends by sending the capture off the machine. */
+export function workflowUploads(workflow: Workflow): boolean {
+  return (workflow.destination ?? '').trim() !== '';
+}
+
+/**
+ * The workflow's destination as one this build can actually reach, or `null`.
+ *
+ * `null` covers both "no destination" and "an id this build has no uploader
+ * for". Pair it with `workflowUploads()` to tell them apart: the first is an
+ * ordinary local workflow, the second is a workflow that would run every step
+ * and then fail, which the editor refuses.
+ */
+export function workflowDestinationOf(value: string | null | undefined): DestinationKind | null {
+  const id = (value ?? '').trim().toLowerCase();
+  return isDestinationKind(id) ? id : null;
+}
+
+/** One segment of the one-line chain summary. */
+export interface WorkflowChainSegment {
+  text: string;
+  /**
+   * This segment is the destination — the only part of the chain with
+   * consequences off this machine, and so the part that must survive
+   * truncation and must not read like the steps beside it.
+   */
+  uploads: boolean;
+}
+
+/** What separates the segments, and the only place it is spelled. */
+export const WORKFLOW_CHAIN_ARROW = ' → ';
+
+/** Roughly how much of the chain fits on one row before it has to give way. */
+export const WORKFLOW_CHAIN_MAX_CHARS = 58;
+
+/**
+ * The whole chain, capture first and destination last.
+ *
+ * **This is the feature, not decoration** (M6 §4): it is what lets a user tell
+ * that a hotkey uploads their screen without opening the workflow. So it is
+ * built from the workflow itself rather than from a stored description, it names
+ * every step, and an unknown step still gets a segment.
+ */
+export function workflowChain(workflow: Workflow): WorkflowChainSegment[] {
+  const segments: WorkflowChainSegment[] = [
+    { text: workflowCaptureSummary(workflow.capture), uploads: false }
+  ];
+  for (const action of workflow.actions) {
+    segments.push({ text: workflowActionSummary(action), uploads: false });
+  }
+  if (workflowUploads(workflow)) {
+    const kind = workflowDestinationOf(workflow.destination);
+    segments.push({
+      text: kind ? DESTINATION_LABEL[kind] : (workflow.destination ?? '').trim(),
+      uploads: true
+    });
+  }
+  return segments;
+}
+
+/** A chain measured against a row, with the middle folded away if it must be. */
+export interface WorkflowChainLine {
+  /** Render these in order, with the marker inserted after `shown[0]`. */
+  shown: WorkflowChainSegment[];
+  /** Segments folded away, or `0` when the whole chain fits. */
+  hidden: number;
+  /** The chain in full, for the row's `title`. */
+  full: string;
+}
+
+/**
+ * The chain as it is rendered, truncated **in the middle** when it is too long.
+ *
+ * The head says what is grabbed and the tail says where it ends up, so the steps
+ * in between are what gives way — the destination is the part with
+ * consequences, and a summary that elided it would be worse than no summary at
+ * all. The capture and the destination are therefore never dropped, whatever the
+ * budget.
+ */
+export function workflowChainLine(
+  workflow: Workflow,
+  maxChars: number = WORKFLOW_CHAIN_MAX_CHARS
+): WorkflowChainLine {
+  const segments = workflowChain(workflow);
+  const full = segments.map((segment) => segment.text).join(WORKFLOW_CHAIN_ARROW);
+
+  const shown = [...segments];
+  let hidden = 0;
+  const width = (count: number): number => {
+    const base = shown.map((segment) => segment.text).join(WORKFLOW_CHAIN_ARROW).length;
+    return count > 0 ? base + WORKFLOW_CHAIN_ARROW.length + 1 + String(count).length : base;
+  };
+  while (shown.length > 2 && width(hidden + 1) > maxChars) {
+    shown.splice(1, 1);
+    hidden++;
+  }
+
+  return { shown, hidden, full };
+}
+
+/* ------------------------------------------------- workflow validation (M6 §4) */
+
+/**
+ * Why a workflow will not do what it looks like it does.
+ *
+ * Every one of these is checked **at edit time**. A workflow that looks fine and
+ * fails when you press its hotkey is the outcome this whole type exists to
+ * design against — by then the user is in another app, the overlay has already
+ * come and gone, and the only evidence is a toast they may not be looking at.
+ */
+export interface WorkflowIssue {
+  /** `error` refuses something; `warning` is said plainly and allowed. */
+  level: 'error' | 'warning';
+  message: string;
+  /**
+   * Whether the workflow may still be **saved** with this issue outstanding.
+   *
+   * An unconfigured destination is fixed on another screen, so refusing the save
+   * would leave the draft with nowhere to go — it is refused the *enabled*
+   * switch instead, which is what stops it ever firing, and a disabled workflow
+   * has no hotkey registered to fail. Everything else here describes a chain
+   * that cannot run at all, and those are refused outright.
+   */
+  savable: boolean;
+}
+
+/** Everything `workflowIssues` needs that is not the workflow itself. */
+export interface WorkflowContext {
+  /** Every workflow, the one under test included — it is matched out by id. */
+  workflows: Workflow[];
+  /** `destination_status()`, or `null` while it has not been read yet. */
+  destinations: DestinationStatus[] | null;
+  /** The live settings, for the built-in hotkeys. `null` before they load. */
+  settings: Settings | null;
+}
+
+/** The built-in accelerator for one action, whichever field backs it. */
+function builtinAccelerator(settings: Settings, action: BuiltinHotkeyAction): string {
+  return action === 'recordStop'
+    ? (settings.recordStopHotkey ?? RECORD_STOP_HOTKEY_DEFAULT)
+    : settings.hotkeys[action];
+}
+
+/**
+ * Actions that need a still image, and the sentence to say when the capture is a
+ * screen recording.
+ *
+ * Not a new rule: these are the same three guards `CaptureCard`, the lightbox
+ * and the ShareX shell already make on a recording (M4 §5), moved to the one
+ * place where they can be made *before* the hotkey is pressed rather than after
+ * the recording has already been taken.
+ */
+const RECORD_INCOMPATIBLE: Partial<Record<WorkflowActionKind, string>> = {
+  annotate:
+    'The editor works on still images, and this workflow records a video. Remove Annotate, or change the capture.',
+  ocr: 'There is no page of text in a video. Remove Read text, or change the capture.',
+  copyImage:
+    'A recording cannot go on the clipboard as an image. Remove Copy image, or change the capture.'
+};
+
+/**
+ * Everything wrong with a workflow, worst first.
+ *
+ * Pure, and shared by the editor and the list on purpose: a row that shows no
+ * warning while the editor shows one would be the same lie in a quieter voice.
+ */
+export function workflowIssues(workflow: Workflow, context: WorkflowContext): WorkflowIssue[] {
+  const issues: WorkflowIssue[] = [];
+  const error = (message: string, savable = false) =>
+    issues.push({ level: 'error', message, savable });
+  const warn = (message: string) => issues.push({ level: 'warning', message, savable: true });
+
+  if (workflow.name.trim() === '') {
+    error('Give the workflow a name — it is what the hotkey list and the toasts call it.');
+  }
+
+  /* ------------------------------------------------------------- the hotkey */
+  if (workflow.trigger.type === 'hotkey') {
+    const accel = workflow.trigger.accelerator.trim();
+    if (normalizeAccelerator(accel) === '') {
+      error('Press a key combination for the trigger, or set it to Run manually.');
+    } else {
+      const keys = displayAccelerator(accel).join(' + ');
+      const settings = context.settings;
+      if (settings) {
+        for (const action of BUILTIN_HOTKEY_ACTIONS) {
+          if (sameAccelerator(builtinAccelerator(settings, action), accel)) {
+            error(`${keys} already runs ${BUILTIN_HOTKEY_OWNER[action]}. Pick another combination.`);
+          }
+        }
+      }
+      for (const other of context.workflows) {
+        if (other.id === workflow.id || other.trigger.type !== 'hotkey') continue;
+        if (sameAccelerator(other.trigger.accelerator, accel)) {
+          error(`${keys} is already bound to the workflow “${other.name.trim() || 'Untitled'}”.`);
+        }
+      }
+    }
+  }
+
+  /* --------------------------------------------------------- the destination */
+  if (workflowUploads(workflow)) {
+    const kind = workflowDestinationOf(workflow.destination);
+    if (!kind) {
+      error(
+        `This build has no uploader called “${(workflow.destination ?? '').trim()}”. Pick a destination, or clear it so the workflow stays on this machine.`
+      );
+    } else if (context.destinations) {
+      const status = context.destinations.find((entry) => entry.kind === kind);
+      if (status && !status.configured) {
+        error(
+          `${status.label} is not set up yet, so this workflow would take the capture, run every step, and then fail at the upload. Configure it in Destinations, or clear the destination.`,
+          true
+        );
+      }
+    }
+  }
+
+  /* ----------------------------------------------------------- the chain */
+  if (workflow.capture.type === 'record') {
+    for (const action of workflow.actions) {
+      const message = RECORD_INCOMPATIBLE[action.type];
+      if (message) error(message);
+    }
+  }
+
+  const indexOfAction = (kind: WorkflowActionKind) =>
+    workflow.actions.findIndex((action) => action.type === kind);
+  const annotateAt = indexOfAction('annotate');
+  const saveAt = indexOfAction('saveToDisk');
+  const copyAt = indexOfAction('copyImage');
+
+  if (annotateAt >= 0 && saveAt >= 0 && annotateAt > saveAt) {
+    warn(
+      'Save to disk runs before Annotate, so the file on disk would be the picture without your annotations. Move Annotate above Save to disk.'
+    );
+  }
+  if (annotateAt >= 0 && copyAt >= 0 && annotateAt > copyAt) {
+    warn(
+      'Copy image runs before Annotate, so the clipboard would hold the picture without your annotations. Move Annotate above Copy image.'
+    );
+  }
+
+  if (workflow.actions.length === 0 && !workflowUploads(workflow)) {
+    warn(
+      'This workflow takes the capture and stops there. Add an action or a destination, or a plain capture hotkey does the same job.'
+    );
+  }
+
+  return issues.sort((a, b) => Number(b.level === 'error') - Number(a.level === 'error'));
+}
+
+/** Whether the draft may be written at all. */
+export function workflowCanSave(issues: WorkflowIssue[]): boolean {
+  return !issues.some((issue) => issue.level === 'error' && !issue.savable);
+}
+
+/**
+ * Whether it may be switched on. Any error keeps it off, which is what makes an
+ * unconfigured destination harmless: a disabled workflow has no hotkey
+ * registered, so there is nothing to press and nothing to fail.
+ */
+export function workflowCanEnable(issues: WorkflowIssue[]): boolean {
+  return !issues.some((issue) => issue.level === 'error');
+}
+
+/* ---------------------------------------------------- workflow hotkeys (M6 §3) */
+
+/**
+ * How a workflow's binding is named in the one hotkey registry it shares with
+ * the built-ins. Spelled here and nowhere else.
+ */
+export const WORKFLOW_HOTKEY_PREFIX = 'workflow:' as const;
+
+export function workflowHotkeyAction(id: string): HotkeyAction {
+  return `${WORKFLOW_HOTKEY_PREFIX}${id}`;
+}
+
+/** The workflow id inside a `HotkeyStatus.action`, or `null` for a built-in. */
+export function workflowIdOfHotkeyAction(action: string): string | null {
+  return action.startsWith(WORKFLOW_HOTKEY_PREFIX)
+    ? action.slice(WORKFLOW_HOTKEY_PREFIX.length)
+    : null;
+}
+
+/* ------------------------------------------------------ workflow runs (M6 §2) */
+
+/**
+ * How each step of a run is named on screen.
+ *
+ * `WorkflowProgress.step` is a plain string and is rendered as it arrives when
+ * it is not in here, so a runner that sends a finished label and one that sends
+ * a tag both render — a chain that runs silently for eight seconds looks broken,
+ * and an unrecognised step name is not a reason to go quiet.
+ */
+export const WORKFLOW_STEP_LABEL: Record<string, string> = {
+  capture: 'Capture',
+  region: 'Region',
+  fullscreen: 'Fullscreen',
+  activeWindow: 'Active window',
+  monitor: 'Monitor',
+  window: 'Window',
+  scrolling: 'Scrolling capture',
+  record: 'Recording',
+  annotate: 'Annotate',
+  saveToDisk: 'Save to disk',
+  copyImage: 'Copy image',
+  ocr: 'Read text',
+  openFolder: 'Open folder',
+  upload: 'Upload'
+};
+
+export function workflowStepLabel(step: string): string {
+  return labelOf(WORKFLOW_STEP_LABEL, step);
+}
+
+/**
+ * Payload of `workflow://progress`, emitted for **every** step (M6 §2).
+ *
+ * `index` is 0-based and `total` counts the capture, every action and the
+ * upload, so `index + 1` of `total` is what a reader says out loud.
+ */
+export interface WorkflowProgress {
+  /** `Workflow.id` — the only way to tell whose run this is. */
+  id: string;
+  step: string;
+  index: number;
+  total: number;
+}
+
+/**
+ * Payload of `workflow://done`: the run reached the end, or was ended cleanly.
+ *
+ * `cancelled` is the flag that matters. A cancelled region selection ends the
+ * workflow **cleanly, not as an error** (M6 §2), and so does backing out of the
+ * editor — raising a red toast for something the user just asked for is a bug.
+ * Read the flag; never match on the message.
+ */
+export interface WorkflowDone {
+  id: string;
+  cancelled: boolean;
+  /** What the run produced, or `null` when it kept nothing. */
+  record: CaptureRecord | null;
+  /** One finished sentence for the user, populated on success too. */
+  message: string;
+}
+
+/**
+ * Payload of `workflow://error`: a step failed and the chain stopped there.
+ *
+ * It names the step, because "workflow failed" leaves the user to guess whether
+ * their capture was taken, saved, or uploaded. The chain does **not** carry on
+ * to the destination with a half-finished result.
+ */
+export interface WorkflowError {
+  id: string;
+  step: string;
+  index: number;
+  message: string;
 }
